@@ -12,15 +12,21 @@ from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-#cfg
+#cfg (maybe put into sole file)
 
 load_dotenv()
 
+#change for new datasets after training
 INPUT_CSV = Path("Datasets/companies.csv")
 OUTPUT_DIR = Path("Datasets/tickers")
 
+#DataFrame slicing
 START_DATE = "2010-01-01"
-END_DATE = "2026-01-01"   # exclusive for yfinance
+END_DATE = "2026-01-01"
+
+#Data Fetching
+FETCH_START_DATE = "2009-01-01"
+FETCH_END_DATE = "2027-01-01"
 
 MAX_WORKERS = 4
 SEC_DELAY = 0.2
@@ -30,7 +36,7 @@ USER_AGENT = os.getenv("Mail")
 if not USER_AGENT:
     raise ValueError("Set Mail in .env for SEC User-Agent, e.g. Mail=your_email@example.com")
 
-ANNUAL_FORMS = {"10-K", "10-K/A"}
+ANNUAL_FORMS = {"10-K", "10-K/A"} #for parsing fundamentals
 
 #DataFrame reader
 
@@ -78,9 +84,13 @@ def build_metadata(ticker: str, industry: Optional[str], df: pd.DataFrame, has_f
         "columns": list(df.columns),
     }
 
-#Market parse agent
+#Market parse agent *
 
 def get_price(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """
+    Input: A TICKER and a time-horizon for parse
+    Output: a Market DataFrame with a Date, Closing Price, Volume columns
+    """
     try:
         data = yf.download(
             ticker,
@@ -123,25 +133,127 @@ def get_price(ticker: str, start: str, end: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def get_yf_shares_series(ticker: str, start: str, end: str) -> pd.DataFrame:
+    try:
+        tk = yf.Ticker(ticker)
+        shares = tk.get_shares_full(start=start, end=end)
+
+        if shares is None or len(shares) == 0:
+            return pd.DataFrame()
+
+        if isinstance(shares, pd.Series):
+            df = shares.to_frame(name="shares_yf")
+        else:
+            df = pd.DataFrame(shares)
+            if df.shape[1] == 1:
+                df.columns = ["shares_yf"]
+            elif "shares_out" in df.columns:
+                df = df.rename(columns={"shares_out": "shares_yf"})
+            elif "Shares" in df.columns:
+                df = df.rename(columns={"Shares": "shares_yf"})
+            else:
+                df = df.rename(columns={df.columns[0]: "shares_yf"})
+
+        idx = pd.to_datetime(df.index, errors="coerce")
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_localize(None)
+
+        df.index = pd.DatetimeIndex(idx).astype("datetime64[ns]")
+        df.index.name = "Date"
+        df["shares_yf"] = pd.to_numeric(df["shares_yf"], errors="coerce")
+        df = df.dropna(subset=["shares_yf"]).sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+
+        return df[["shares_yf"]]
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def merge_shares_asof(price_df: pd.DataFrame, shares_df: pd.DataFrame) -> pd.DataFrame:
+    if shares_df is None or shares_df.empty:
+        return price_df
+
+    left = price_df.reset_index().rename(columns={"Date": "date"})
+    right = shares_df.reset_index().rename(columns={"Date": "shares_date"})
+
+    left["date"] = pd.to_datetime(left["date"], errors="coerce").astype("datetime64[ns]")
+    right["shares_date"] = pd.to_datetime(right["shares_date"], errors="coerce").astype("datetime64[ns]")
+
+    left = left.dropna(subset=["date"]).sort_values("date")
+    right = right.dropna(subset=["shares_date"]).sort_values("shares_date")
+
+    merged = pd.merge_asof(
+        left,
+        right,
+        left_on="date",
+        right_on="shares_date",
+        direction="backward",
+        tolerance=pd.Timedelta(days=550),
+    )
+
+    merged = merged.drop(columns=["shares_date"], errors="ignore")
+    merged = merged.set_index("date")
+    merged.index.name = "Date"
+    return merged
+
+
+def add_valuation_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if {"price", "shares_yf"}.issubset(df.columns):
+        df["market_cap"] = df["price"] * df["shares_yf"]
+    else:
+        df["market_cap"] = np.nan
+
+    if {"market_cap", "debt", "cash"}.issubset(df.columns):
+        df["ev"] = df["market_cap"] + df["debt"].fillna(0) - df["cash"].fillna(0)
+    else:
+        df["ev"] = np.nan
+
+    return df
+
+
 def compute_returns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Input: Market DataFrame with 'returns' column
+    Output: Computes Log-returns for DataFrame
+    """
     df = df.copy()
     df["ret"] = np.log(df["price"] / df["price"].shift(1))
+    df["ret"] = df["ret"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return df
 
 
 def compute_volatility(df: pd.DataFrame, window: int = 21) -> pd.DataFrame:
+    """
+    Input: Log-returns dataframe, rolling window
+    Output: Computes 21d Variance Coefficient of log-returns
+    """
     df = df.copy()
-    df["volatility_21d"] = df["ret"].rolling(window).std()
+    roll_std = df["ret"].rolling(window=window, min_periods=2).std()
+    roll_mean = df["ret"].rolling(window=window, min_periods=2).mean()
+
+    df["volatility_21d"] = ((roll_std / roll_mean).abs()) * 100
+    df["volatility_21d"] = df["volatility_21d"].replace([np.inf, -np.inf], np.nan)
     return df
 
 
 def compute_log_volume(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Input: Market DataFrame with 'Volumes' column
+    Output: computes Log-Volumes (natural logarithm)
+    """
     df = df.copy()
     df["log_volume"] = np.where(df["volume"] > 0, np.log(df["volume"]), np.nan)
     return df
 
 
 def compute_beta(df: pd.DataFrame, ewm_span: int = 63) -> pd.DataFrame:
+    """
+    Input: DataFrame with Benchmark's and TICKER's log-returns, moving average window
+    Output: Exponential Moving Average beta DataFrame for a time-window
+    """
     df = df.copy()
 
     x = df["ret"]
@@ -155,10 +267,16 @@ def compute_beta(df: pd.DataFrame, ewm_span: int = 63) -> pd.DataFrame:
     var_ewm = y.ewm(span=ewm_span, adjust=False).var()
 
     df["beta_ewm"] = cov_ewm / var_ewm
+    df["beta_ewm"] = df["beta_ewm"].replace([np.inf, -np.inf], np.nan)
+    df["beta_ewm"] = df["beta_ewm"].ffill()
     return df
 
 
 def load_market_returns(start: str, end: str, benchmark: str = "^GSPC") -> pd.DataFrame:
+    """
+    Input: Benchmark( S&P500 as standard ), time-horizon
+    Output: Computes log-returns for Market Benchmark at a time horizon
+    """
     market = get_price(benchmark, start=start, end=end)
     if market.empty:
         raise RuntimeError(f"Failed to load market benchmark {benchmark}")
@@ -167,8 +285,7 @@ def load_market_returns(start: str, end: str, benchmark: str = "^GSPC") -> pd.Da
     market = market.rename(columns={"ret": "return_market"})
     return market[["return_market"]]
 
-#SEC parse agent
-
+#SEC parse agent *
 class SecClient:
     def __init__(self, user_agent: str, delay: float = 0.2):
         self.session = requests.Session()
@@ -179,6 +296,10 @@ class SecClient:
         self.cik_map = self._load_cik_map()
 
     def _get_json(self, url: str, timeout: int = 30) -> Optional[dict]:
+        """
+        Input: a json url, timeout(seconds) limit
+        Output: Sets a parse-rate limit and prevents multithreading
+        """
         with self._lock:
             now = time.monotonic()
             wait = self.delay - (now - self._last_call)
@@ -195,6 +316,9 @@ class SecClient:
                 return None
 
     def _load_cik_map(self) -> dict[str, str]:
+        """
+        Output: A {TICKER:SEC_NUMBER} Dict for all available to SEC companies
+        """
         raw = self._get_json("https://www.sec.gov/files/company_tickers.json")
         if not raw:
             raise RuntimeError("Failed to load SEC company_tickers.json")
@@ -205,9 +329,17 @@ class SecClient:
         }
 
     def get_cik(self, ticker: str) -> Optional[str]:
+        """
+        Input: TICKER
+        Output: str SEC number for the TICKER
+        """
         return self.cik_map.get(str(ticker).upper().strip())
 
     def get_company_facts(self, ticker: str) -> Optional[dict]:
+        """
+        Input: TICKER
+        Output: Dict of all SEC reports of a TICKER
+        """
         cik = self.get_cik(ticker)
         if not cik:
             return None
@@ -219,7 +351,7 @@ class SecClient:
 
         return data.get("facts", {}).get("us-gaap")
 
-#Fundamentals grouping agent
+#Fundamentals grouping agent *
 
 def get_metric_dataframe(
     facts: dict,
@@ -227,6 +359,10 @@ def get_metric_dataframe(
     preferred_units: tuple[str, ...],
     annual_only: bool = True,
 ) -> pd.DataFrame:
+    """
+    Input: get_company_facts, metric name, preferred_units array, True for of 10-K or 10-K/A annual reports
+    Output: A metric DataFrame of full-available time-horizon
+    """
     if metric not in facts:
         return pd.DataFrame()
 
@@ -268,26 +404,121 @@ def get_metric_dataframe(
 
     return df.sort_values("filed").reset_index(drop=True)
 
+def get_metric_dataframe_multi(
+    facts: dict,
+    metrics: tuple[str, ...],
+    preferred_units: tuple[str, ...],
+    annual_only: bool = True,
+) -> pd.DataFrame:
+    """
+    Input: get_company_facts, various metrics to yield the one, preferred from them
+    Output: get_metric_dataframe used for metrics with other possible names in SEC reports
+    """
+    for metric in metrics:
+        metric_df = get_metric_dataframe(
+            facts=facts,
+            metric=metric,
+            preferred_units=preferred_units,
+            annual_only=annual_only,
+        )
+        if metric_df is not None and not metric_df.empty:
+            return metric_df
+
+    return pd.DataFrame()
 
 def extract_fundamentals(facts: dict) -> Optional[pd.DataFrame]:
+    """
+    Input: get_company_facts function's yield
+    Output: DataFrame of following fundamentals for a full-available time-horizon
+    """
     metric_map = {
-        "revenue": ("Revenues", ("USD",)),
-        "ebit": ("OperatingIncomeLoss", ("USD",)),
-        "net_income": ("NetIncomeLoss", ("USD",)),
-        "assets": ("Assets", ("USD",)),
-        "equity": ("StockholdersEquity", ("USD",)),
-        "debt": ("LongTermDebt", ("USD",)),
-        "cash": ("CashAndCashEquivalentsAtCarryingValue", ("USD",)),
-        "capex": ("PaymentsToAcquirePropertyPlantAndEquipment", ("USD",)),
-        "ocf": ("NetCashProvidedByUsedInOperatingActivities", ("USD",)),
-        "shares": ("CommonStockSharesOutstanding", ("shares", "pure")),
-        "interest": ("InterestExpense", ("USD",)),
+        "revenue": (
+            (
+                "Revenues",
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "RevenueFromContractWithCustomerIncludingAssessedTax",
+                "SalesRevenueNet",
+            ),
+            ("USD",),
+        ),
+        "ebit": (
+            (
+                "OperatingIncomeLoss",
+                "IncomeLossFromOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+            ),
+            ("USD",),
+        ),
+        "net_income": (
+            (
+                "NetIncomeLoss",
+                "ProfitLoss",
+            ),
+            ("USD",),
+        ),
+        "assets": (
+            (
+                "Assets",
+            ),
+            ("USD",),
+        ),
+        "equity": (
+            (
+                "StockholdersEquity",
+                "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+            ),
+            ("USD",),
+        ),
+        "debt": (
+            (
+                "LongTermDebt",
+                "LongTermDebtAndCapitalLeaseObligations",
+                "LongTermDebtNoncurrent",
+                "LongTermDebtCurrent",
+                "ShortTermBorrowings",
+                "LongTermDebtAndShortTermBorrowings",
+                "NotesPayableAndLongTermDebt",
+            ),
+            ("USD",),
+        ),
+        "cash": (
+            (
+                "CashAndCashEquivalentsAtCarryingValue",
+                "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+            ),
+            ("USD",),
+        ),
+        "capex": (
+            (
+                "PaymentsToAcquirePropertyPlantAndEquipment",
+                "CapitalExpendituresIncurredButNotYetPaid",
+            ),
+            ("USD",),
+        ),
+        "ocf": (
+            (
+                "NetCashProvidedByUsedInOperatingActivities",
+                "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+            ),
+            ("USD",),
+        ),
+        "interest": (
+            (
+                "InterestExpense",
+                "InterestAndDebtExpense",
+            ),
+            ("USD",),
+        ),
     }
 
     merged = None
 
-    for out_name, (tag, units) in metric_map.items():
-        metric_df = get_metric_dataframe(facts, tag, units, annual_only=True)
+    for out_name, (tags, units) in metric_map.items():
+        metric_df = get_metric_dataframe_multi(
+            facts=facts,
+            metrics=tags,
+            preferred_units=units,
+            annual_only=True,
+        )
         if metric_df.empty:
             continue
 
@@ -318,6 +549,10 @@ def extract_fundamentals(facts: dict) -> Optional[pd.DataFrame]:
 
 
 def merge_fundamentals_asof(price_df: pd.DataFrame, fund_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Input: get_price and extract_fundamentals functions' results
+    Output: Merges Market and Sec parse results by the nearest past filing date
+    """
     if fund_df is None or fund_df.empty:
         return price_df
 
@@ -337,7 +572,7 @@ def merge_fundamentals_asof(price_df: pd.DataFrame, fund_df: pd.DataFrame) -> pd
         left_on="date",
         right_on="filing_date",
         direction="backward",
-        tolerance=pd.Timedelta(days=550),
+        tolerance=pd.Timedelta(days=730),
     )
 
     merged = merged.set_index("date")
@@ -379,6 +614,10 @@ def process_ticker(
         df = compute_volatility(df)
         df = compute_log_volume(df)
 
+        shares_df = get_yf_shares_series(ticker, start=start_date, end=end_date)
+        if not shares_df.empty:
+            df = merge_shares_asof(df, shares_df)
+
         has_fundamentals = False
         facts = sec_client.get_company_facts(ticker)
 
@@ -387,6 +626,10 @@ def process_ticker(
             if fund_df is not None and not fund_df.empty:
                 df = merge_fundamentals_asof(df, fund_df)
                 has_fundamentals = True
+
+        df = add_valuation_columns(df)
+
+        df = df.loc[(df.index >= pd.Timestamp(START_DATE)) & (df.index < pd.Timestamp(END_DATE))].copy()
 
         df["ticker"] = ticker
         df["industry"] = industry
@@ -416,7 +659,7 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    market_df = load_market_returns(start=START_DATE, end=END_DATE)
+    market_df = load_market_returns(start=FETCH_START_DATE, end=FETCH_END_DATE)
     sec_client = SecClient(user_agent=USER_AGENT, delay=SEC_DELAY)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -427,8 +670,8 @@ def main():
                 market_df=market_df,
                 sec_client=sec_client,
                 output_dir=OUTPUT_DIR,
-                start_date=START_DATE,
-                end_date=END_DATE,
+                start_date=FETCH_START_DATE,
+                end_date=FETCH_END_DATE,
                 force_rebuild=FORCE_REBUILD,
             )
             for _, row in companies.iterrows()
