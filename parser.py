@@ -3,7 +3,6 @@ import json
 import time
 import threading
 from pathlib import Path
-from typing import Optional
 import numpy as np
 import pandas as pd
 import requests
@@ -17,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 load_dotenv()
 
 #change for new datasets after training
-INPUT_CSV = Path("Datasets/companies.csv")
+INPUT_CSV = Path("Datasets/companies.csv") #Source: Kaggle US Stocks & ETFs - Tickers, Company Info, Logos
 OUTPUT_DIR = Path("Datasets/tickers")
 
 #DataFrame slicing
@@ -36,7 +35,7 @@ USER_AGENT = os.getenv("Mail")
 if not USER_AGENT:
     raise ValueError("Set Mail in .env for SEC User-Agent, e.g. Mail=your_email@example.com")
 
-ANNUAL_FORMS = {"10-K", "10-K/A"} #for parsing fundamentals
+ANNUAL_FORMS = {"10-K", "10-K/A"} #for parsing SEC fundamentals
 
 #DataFrame reader
 
@@ -73,7 +72,7 @@ def atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
     tmp.replace(path)
 
 
-def build_metadata(ticker: str, industry: Optional[str], df: pd.DataFrame, has_fundamentals: bool) -> dict:
+def build_metadata(ticker: str, industry: str | None, df: pd.DataFrame, has_fundamentals: bool) -> dict:
     return {
         "ticker": ticker,
         "industry": industry,
@@ -198,22 +197,6 @@ def merge_shares_asof(price_df: pd.DataFrame, shares_df: pd.DataFrame) -> pd.Dat
     return merged
 
 
-def add_valuation_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    if {"price", "shares_yf"}.issubset(df.columns):
-        df["market_cap"] = df["price"] * df["shares_yf"]
-    else:
-        df["market_cap"] = np.nan
-
-    if {"market_cap", "debt", "cash"}.issubset(df.columns):
-        df["ev"] = df["market_cap"] + df["debt"].fillna(0) - df["cash"].fillna(0)
-    else:
-        df["ev"] = np.nan
-
-    return df
-
-
 def compute_returns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Input: Market DataFrame with 'returns' column
@@ -275,17 +258,21 @@ def compute_beta(df: pd.DataFrame, ewm_span: int = 63) -> pd.DataFrame:
 def load_market_returns(start: str, end: str, benchmark: str = "^GSPC") -> pd.DataFrame:
     """
     Input: Benchmark( S&P500 as standard ), time-horizon
-    Output: Computes log-returns for Market Benchmark at a time horizon
+    Output: Computes log-returns and keeps benchmark price
     """
     market = get_price(benchmark, start=start, end=end)
     if market.empty:
         raise RuntimeError(f"Failed to load market benchmark {benchmark}")
 
     market = compute_returns(market)
-    market = market.rename(columns={"ret": "return_market"})
-    return market[["return_market"]]
+    market = market.rename(columns={
+        "price": "market_price",
+        "ret": "return_market"
+    })
+    return market[["market_price", "return_market"]]
 
 #SEC parse agent *
+
 class SecClient:
     def __init__(self, user_agent: str, delay: float = 0.2):
         self.session = requests.Session()
@@ -295,7 +282,7 @@ class SecClient:
         self._last_call = 0.0
         self.cik_map = self._load_cik_map()
 
-    def _get_json(self, url: str, timeout: int = 30) -> Optional[dict]:
+    def _get_json(self, url: str, timeout: int = 30) -> dict | None:
         """
         Input: a json url, timeout(seconds) limit
         Output: Sets a parse-rate limit and prevents multithreading
@@ -328,14 +315,14 @@ class SecClient:
             for v in raw.values()
         }
 
-    def get_cik(self, ticker: str) -> Optional[str]:
+    def get_cik(self, ticker: str) -> str | None:
         """
         Input: TICKER
         Output: str SEC number for the TICKER
         """
         return self.cik_map.get(str(ticker).upper().strip())
 
-    def get_company_facts(self, ticker: str) -> Optional[dict]:
+    def get_company_facts(self, ticker: str) -> dict | None:
         """
         Input: TICKER
         Output: Dict of all SEC reports of a TICKER
@@ -404,6 +391,7 @@ def get_metric_dataframe(
 
     return df.sort_values("filed").reset_index(drop=True)
 
+
 def get_metric_dataframe_multi(
     facts: dict,
     metrics: tuple[str, ...],
@@ -426,38 +414,16 @@ def get_metric_dataframe_multi(
 
     return pd.DataFrame()
 
-def extract_fundamentals(facts: dict) -> Optional[pd.DataFrame]:
+def extract_fundamentals(facts: dict) -> pd.DataFrame | None:
     """
     Input: get_company_facts function's yield
     Output: DataFrame of following fundamentals for a full-available time-horizon
     """
     metric_map = {
-        "revenue": (
-            (
-                "Revenues",
-                "RevenueFromContractWithCustomerExcludingAssessedTax",
-                "RevenueFromContractWithCustomerIncludingAssessedTax",
-                "SalesRevenueNet",
-            ),
-            ("USD",),
-        ),
         "ebit": (
             (
                 "OperatingIncomeLoss",
                 "IncomeLossFromOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
-            ),
-            ("USD",),
-        ),
-        "net_income": (
-            (
-                "NetIncomeLoss",
-                "ProfitLoss",
-            ),
-            ("USD",),
-        ),
-        "assets": (
-            (
-                "Assets",
             ),
             ("USD",),
         ),
@@ -468,15 +434,32 @@ def extract_fundamentals(facts: dict) -> Optional[pd.DataFrame]:
             ),
             ("USD",),
         ),
-        "debt": (
+        "total_debt": (
+            (
+                "DebtAndFinanceLeaseObligations",
+                "DebtAndCapitalLeaseObligations",
+                "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+                "LongTermDebtAndFinanceLeaseObligationsIncludingCurrentMaturities",
+            ),
+            ("USD",),
+        ),
+        "long_term_debt": (
             (
                 "LongTermDebt",
-                "LongTermDebtAndCapitalLeaseObligations",
                 "LongTermDebtNoncurrent",
-                "LongTermDebtCurrent",
+                "LongTermDebtAndCapitalLeaseObligations",
+                "LongTermDebtAndFinanceLeaseObligations",
+            ),
+            ("USD",),
+        ),
+        "short_term_debt": (
+            (
                 "ShortTermBorrowings",
-                "LongTermDebtAndShortTermBorrowings",
-                "NotesPayableAndLongTermDebt",
+                "LongTermDebtCurrent",
+                "ShortTermBankLoansAndNotesPayable",
+                "CurrentPortionOfLongTermDebt",
+                "CurrentPortionOfLongTermDebtAndCapitalLeaseObligations",
+                "CurrentPortionOfLongTermDebtAndFinanceLeaseObligations",
             ),
             ("USD",),
         ),
@@ -498,13 +481,6 @@ def extract_fundamentals(facts: dict) -> Optional[pd.DataFrame]:
             (
                 "NetCashProvidedByUsedInOperatingActivities",
                 "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
-            ),
-            ("USD",),
-        ),
-        "interest": (
-            (
-                "InterestExpense",
-                "InterestAndDebtExpense",
             ),
             ("USD",),
         ),
@@ -578,6 +554,38 @@ def merge_fundamentals_asof(price_df: pd.DataFrame, fund_df: pd.DataFrame) -> pd
     merged = merged.set_index("date")
     merged.index.name = "Date"
     return merged
+
+def add_valuation_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Input: joined market and fundamental DataFrame
+    Output: DataFrame with columns dedicated to valuation(Net_Debt, EV, FCFF, Market Cap)
+    """
+    df = df.copy()
+    def as_series(value, index):
+        if isinstance(value, pd.Series):
+            return pd.to_numeric(value, errors="coerce").reindex(index)
+        if value is None:
+            return pd.Series(np.nan, index=index, dtype="float64")
+        return pd.Series(value, index=index, dtype="float64")
+
+    price = as_series(df.get("price"), df.index)
+    shares = as_series(df.get("shares_yf"), df.index)
+    cash = as_series(df.get("cash"), df.index).fillna(0.0)
+    total_debt = as_series(df.get("total_debt"), df.index)
+    long_term_debt = as_series(df.get("long_term_debt"), df.index)
+    short_term_debt = as_series(df.get("short_term_debt"), df.index)
+    df["market_cap"] = price * shares
+
+    #If total_debt is empty -> total_debt = long term + short term
+    debt_parts = long_term_debt.fillna(0.0) + short_term_debt.fillna(0.0)
+    df["total_debt"] = total_debt.where(total_debt.notna(), debt_parts)
+    df["net_debt"] = df["total_debt"] - cash
+
+    ocf = as_series(df.get("ocf"), df.index)
+    capex = as_series(df.get("capex"), df.index)
+    df["fcff"] = ocf - capex
+    df["ev"] = df["market_cap"] + df["total_debt"] - cash
+    return df
 
 #pipeline
 

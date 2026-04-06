@@ -2,33 +2,127 @@ import pandas as pd
 import json
 import os
 import numpy as np
-from calendar import monthrange
-
+from pathlib import Path
 
 #cfg
-ds = os.listdir("Datasets/tickers/")
+
+ds = os.listdir("Datasets/tickers/") #Directory of parquets for every TICKER
+
+INPUT_CSV = Path("Datasets/US_WaccComponents_Timeseries.csv") #Source: Stern-Damodaran & IRS
+wacc_df = pd.read_csv(INPUT_CSV, sep = ";", header = 0, index_col = "Year")
 
 #DataFrame processing
 
-def time_slicing(ticker: str, start_year: int, end_year: int, shift: int = 31) -> pd.DataFrame:
+def time_slicing(
+        ticker: str,
+        start_year: int,
+        end_year: int,
+        shift: int = 5,
+) -> pd.DataFrame:
     """
-    Input: DataFrame to process, Start & End year, Shift-days after the beginning of the year
-    shift in between [1-31], years between [2010-2025]
+    Input: DataFrame to process, Start & End year, Shift-days after filing date
     Output: A sliced DataFrame by real date
     """
-    if not (1 <= shift <= 31):
-        raise ValueError("shift must be in [1, 31]")
+    if shift < 0:
+        raise ValueError("shift must be >= 0")
 
-    start_year = str(start_year)
-    end_year = str(end_year)
+    df = pd.read_parquet(f"Datasets/tickers/{ticker}/timeseries.parquet").copy()
 
-    df = pd.read_parquet(f"Datasets/tickers/{ticker}/timeseries.parquet")
-    start = pd.Timestamp(f"{start_year}-01-{shift:02d}")
-    end = pd.Timestamp(f"{end_year}-01-{shift:02d}")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame index must be DatetimeIndex")
 
-    return df.loc[(df.index >= start) & (df.index <= end)].copy()
+    if "filing_date" not in df.columns:
+        raise ValueError("DataFrame must contain 'filing_date' column")
 
-def has_fundamentals(ticker: str) -> bool:
+    df = df.sort_index()
+    df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce")
+
+    def get_boundary(year: int) -> pd.Timestamp | None:
+        base_date = pd.Timestamp(year=year, month=1, day=1)
+
+        candidates = df.loc[df.index >= base_date]
+        if candidates.empty:
+            return None
+
+        first_row = candidates.iloc[0]
+        filing_date = first_row["filing_date"]
+
+        if pd.isna(filing_date):
+            return None
+
+        min_valid_date = filing_date + pd.Timedelta(days=shift)
+
+        valid = candidates.loc[candidates.index >= min_valid_date]
+        if valid.empty:
+            return None
+
+        return valid.index[0]
+
+    start_date = get_boundary(start_year)
+    end_exclusive = get_boundary(end_year + 1)
+
+    if start_date is None:
+        return pd.DataFrame()
+
+    if end_exclusive is None:
+        return df.loc[start_date:].copy()
+
+    return df.loc[(df.index >= start_date) & (df.index < end_exclusive)].copy()
+
+def year_slicing(ticker: str, start_year: int, end_year: int, shift: int = 5) -> pd.DataFrame:
+    """
+    Input: ticker, start and end decision years, shift-days after filing date
+    Output: one row per year at the first valid real date
+    """
+    if shift < 0:
+        raise ValueError("shift must be >= 0")
+
+    df = pd.read_parquet(f"Datasets/tickers/{ticker}/timeseries.parquet").copy()
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame index must be DatetimeIndex")
+
+    if "filing_date" not in df.columns:
+        raise ValueError("DataFrame must contain 'filing_date' column")
+
+    df = df.sort_index()
+    df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce")
+
+    rows = []
+
+    for year in range(start_year, end_year + 1):
+        base_date = pd.Timestamp(year=year, month=1, day=1)
+
+        year_slice = df[df.index >= base_date]
+        if year_slice.empty:
+            continue
+
+        first_row = year_slice.iloc[0]
+        filing_date = first_row["filing_date"]
+
+        if pd.isna(filing_date):
+            continue
+
+        min_valid_date = filing_date + pd.Timedelta(days=shift)
+
+        if first_row.name >= min_valid_date:
+            chosen = first_row.copy()
+        else:
+            valid_rows = year_slice[year_slice.index >= min_valid_date]
+            if valid_rows.empty:
+                continue
+            chosen = valid_rows.iloc[0].copy()
+
+        chosen["decision_year"] = year
+        chosen["decision_date"] = chosen.name
+        rows.append(chosen)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+def has_fundamentals(ticker: str) -> bool: #1700+ as of last input dataset
     """
     Input: Ticker
     Output: Whether meta.json says has_fundamentals == True
@@ -47,23 +141,14 @@ def has_fundamentals(ticker: str) -> bool:
 def dcf_proxy(
         df: pd.DataFrame,
         date_col: str = "Date",
-        n_years: int = 6,
-        min_fund_years: int = 4,
-        shift_month: int = 1,
-        shift_day: int = 31,
-        forward_days: int = 5,
         positive_multiples_only: bool = True,
-        use_filing_date: bool = True,
-        treat_missing_debt_cash_as_zero: bool = True,
-) -> pd.DataFrame:
+) -> pd.Series:
     """
     Input: sliced timeseries DataFrame
-    Output: Annualizes fundamentals into single values, computes market multiples
-    If < 4 history years of fundamentals - return None
+    Output: returns 5th historical year FCFF, FCFF CAGR, EV/EBIT, Y5 price, Y6 price, and Y5 net debt
     """
     if df is None or df.empty:
-        return pd.DataFrame()
-
+        return pd.Series(dtype="float64")
     data = df.copy()
 
     if date_col in data.columns:
@@ -74,232 +159,68 @@ def dcf_proxy(
     else:
         raise ValueError(f"DataFrame must contain '{date_col}' column or DatetimeIndex")
 
-    if "period_end" not in data.columns:
-        raise ValueError("DataFrame must contain 'period_end' column")
-
-    data["period_end"] = pd.to_datetime(data["period_end"], errors="coerce")
-    if "filing_date" in data.columns:
-        data["filing_date"] = pd.to_datetime(data["filing_date"], errors="coerce")
-    else:
-        data["filing_date"] = pd.NaT
-
     data = data.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
-    if data.empty:
-        return pd.DataFrame()
+    if len(data) < 6:
+        return pd.Series(dtype="float64")
 
-    numeric_cols = [
-        "price", "volume", "return_market", "ret", "beta_ewm", "volatility_21d",
-        "log_volume", "revenue", "ebit", "net_income", "assets", "equity",
-        "debt", "cash", "capex", "ocf", "shares_yf", "interest", "market_cap", "ev"
-    ]
-    for col in numeric_cols:
+    for col in ["price", "ev", "ebit", "fcff", "net_debt"]:
         if col in data.columns:
             data[col] = pd.to_numeric(data[col], errors="coerce")
         else:
             data[col] = np.nan
 
-    for col in ["ticker", "industry"]:
-        if col not in data.columns:
-            data[col] = np.nan
+    fcff_1 = data.iloc[0]["fcff"]
+    fcff_5 = data.iloc[4]["fcff"]
+    ebit_5 = data.iloc[4]["ebit"]
+    ev_5 = data.iloc[4]["ev"]
+    price_5 = data.iloc[4]["price"]
+    price_6 = data.iloc[5]["price"]
+    net_debt_5 = data.iloc[4]["net_debt"]
+    total_debt_5 = data.iloc[4]["total_debt"]
+    market_cap_5 = data.iloc[4]["market_cap"]
+    market_price_5 = data.iloc[4]["market_price"]
+    market_price_6 = data.iloc[5]["market_price"]
 
-    def make_anchor(year: int, month: int, day: int) -> pd.Timestamp:
-        last_day = monthrange(year, month)[1]
-        return pd.Timestamp(year=year, month=month, day=min(day, last_day))
+    fcff_cagr = np.nan
+    if pd.notna(fcff_1) and pd.notna(fcff_5) and fcff_1 > 0 and fcff_5 > 0:
+        fcff_cagr = (fcff_5 / fcff_1) ** (1 / 4) - 1
 
-    def valid_den(x):
-        if pd.isna(x):
-            return False
-        return x > 0 if positive_multiples_only else x != 0
+    ev_ebit = np.nan
+    if pd.notna(ev_5) and pd.notna(ebit_5):
+        if positive_multiples_only:
+            if ebit_5 > 0:
+                ev_ebit = ev_5 / ebit_5
+        elif ebit_5 != 0:
+            ev_ebit = ev_5 / ebit_5
 
-    fund_table = data.dropna(subset=["period_end"]).copy()
-    if fund_table.empty:
-        return pd.DataFrame()
+    return pd.Series({
+        "fcff": fcff_5,
+        "fcff_cagr": fcff_cagr,
+        "ev_ebit": ev_ebit,
+        "price_5": price_5,
+        "price_6": price_6,
+        "net_debt_5": net_debt_5,
+        "market_price_5": market_price_5,
+        "market_price_6": market_price_6,
+        "total_debt_5": total_debt_5,
+        "market_cap_5": market_cap_5
+    })
 
-    fund_table["fund_year"] = fund_table["period_end"].dt.year
-
-    fund_table = (
-        fund_table
-        .sort_values(["fund_year", "filing_date", "period_end", date_col])
-        .drop_duplicates(subset=["fund_year"], keep="last")
-        .sort_values("fund_year")
-        .reset_index(drop=True)
-    )
-
-    if use_filing_date and fund_table["filing_date"].notna().any():
-        fund_table["available_date"] = fund_table["filing_date"]
-    else:
-        fund_table["available_date"] = fund_table["period_end"]
-
-    start_year = data[date_col].min().year
-    rows = []
-
-    for i in range(n_years):
-        decision_year = start_year + i
-        decision_date = make_anchor(decision_year, shift_month, shift_day)
-
-        after_decision = data[data[date_col] >= decision_date].copy()
-        if after_decision.empty:
-            continue
-
-        market_idx = min(forward_days - 1, len(after_decision) - 1)
-        market_row = after_decision.iloc[market_idx].copy()
-        market_date = market_row[date_col]
-
-        eligible_fund = fund_table[fund_table["available_date"] <= market_date].copy()
-
-        if eligible_fund.empty:
-            fund_row = None
-        else:
-            fund_row = eligible_fund.iloc[-1].copy()
-
-        out = {
-            "market_date": market_date,
-            "ticker": market_row.get("ticker", np.nan),
-            "industry": market_row.get("industry", np.nan),
-            "price": market_row.get("price", np.nan),
-            "volume": market_row.get("volume", np.nan),
-            "return_market": market_row.get("return_market", np.nan),
-            "ret": market_row.get("ret", np.nan),
-            "beta_ewm": market_row.get("beta_ewm", np.nan),
-            "volatility_21d": market_row.get("volatility_21d", np.nan),
-            "log_volume": market_row.get("log_volume", np.nan),
-            "shares_yf": market_row.get("shares_yf", np.nan),
-            "market_cap": market_row.get("market_cap", np.nan),
-            "ev": market_row.get("ev", np.nan),
-        }
-
-        fund_cols = [
-            "filing_date", "period_end", "fund_year",
-            "revenue", "ebit", "net_income", "assets", "equity",
-            "debt", "cash", "capex", "ocf", "interest"
-        ]
-
-        if fund_row is None:
-            for col in fund_cols:
-                out[col] = np.nan
-        else:
-            for col in fund_cols:
-                out[col] = fund_row.get(col, np.nan)
-
-        price = out["price"]
-        shares_yf = out["shares_yf"]
-        debt = out["debt"]
-        cash = out["cash"]
-        ebit = out["ebit"]
-        revenue = out["revenue"]
-        ocf = out["ocf"]
-        net_income = out["net_income"]
-        equity = out["equity"]
-        market_cap = out["market_cap"]
-        ev = out["ev"]
-
-        if pd.isna(market_cap) and pd.notna(price) and pd.notna(shares_yf):
-            market_cap = price * shares_yf
-
-        debt_for_ev = 0.0 if (treat_missing_debt_cash_as_zero and pd.isna(debt)) else debt
-        cash_for_ev = 0.0 if (treat_missing_debt_cash_as_zero and pd.isna(cash)) else cash
-
-        if pd.isna(ev) and pd.notna(market_cap) and pd.notna(debt_for_ev) and pd.notna(cash_for_ev):
-            ev = market_cap + debt_for_ev - cash_for_ev
-
-        pb = np.nan
-        if pd.notna(market_cap) and valid_den(equity):
-            pb = market_cap / equity
-
-        pe = np.nan
-        if pd.notna(market_cap) and valid_den(net_income):
-            pe = market_cap / net_income
-
-        ev_ebit = np.nan
-        if pd.notna(ev) and valid_den(ebit):
-            ev_ebit = ev / ebit
-
-        ev_revenue = np.nan
-        if pd.notna(ev) and valid_den(revenue):
-            ev_revenue = ev / revenue
-
-        ev_ocf = np.nan
-        if pd.notna(ev) and valid_den(ocf):
-            ev_ocf = ev / ocf
-
-        out["market_cap"] = market_cap
-        out["ev"] = ev
-        out["ev_ebit"] = ev_ebit
-        out["ev_revenue"] = ev_revenue
-        out["ev_ocf"] = ev_ocf
-        out["pe"] = pe
-        out["pb"] = pb
-
-        rows.append(out)
-
-    result = pd.DataFrame(rows)
-    if result.empty:
-        return pd.DataFrame()
-
-    hist_result = result.iloc[: max(0, n_years - 1)].copy()
-    found_fund_years = hist_result["fund_year"].dropna().nunique()
-
-    if found_fund_years < min_fund_years:
-        return pd.DataFrame()
-
-    return result.reset_index(drop=True)
-
-def normalize_multiples(df: pd.DataFrame) -> pd.DataFrame:
+def wacc_proxy(ticker: str, valuation_year: int) -> float:
     """
-    Input: DataFrame after dcf_proxy
-    Output: Normalizes market multiples by the caps and log's
+    Input: Unsliced daily DataFrame, final year of valuation
+    Output: Weighted Average Cost of Capital for a Company at a given moment
     """
-    df = df.copy()
-    caps = {
-        "pe": 100,
-        "pb": 20,
-        "ev_ebit": 50,
-        "ev_revenue": 20,
-        "ev_ocf": 50,
-    }
-    for col, cap in caps.items():
-        if col in df.columns:
-            df[col] = df[col].clip(0, cap)
-            df[col + "_log"] = np.log1p(df[col])
-    return df
+    DailyDf = time_slicing(ticker, valuation_year - 4, valuation_year)
+    YearlySeries = year_slicing(ticker, valuation_year - 4, valuation_year)
 
-def fcff_CAGR(
-        df: pd.DataFrame,
-        year_col: str = "fund_year",
-        ocf_col: str = "ocf",
-        capex_col: str = "capex",
-) -> float:
-    if df is None or df.empty:
-        return np.nan
+    #Cost of Capital Components - CAPM model
+    beta = np.median(DailyDf["beta_ewm"])
+    risk_free = wacc_df[valuation_year, "T_Bond_Rate"]
+    equity_premium = wacc_df[valuation_year, "Implied_ERP_(FCFE)"]
 
-    data = df.copy()
+    CostOfCapital = (risk_free + beta * equity_premium)
+    tax_rate = wacc_df[valuation_year, "US_Marginal_Tax_Rate"]
 
-    required_cols = [year_col, ocf_col, capex_col]
-    for col in required_cols:
-        if col not in data.columns:
-            return np.nan
 
-    for col in required_cols:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
-
-    data = data.dropna(subset=[year_col]).sort_values(year_col).reset_index(drop=True)
-    if len(data) < 5:
-        return np.nan
-
-    data["fcff"] = data[ocf_col] - data[capex_col]
-    data["fcff"] = data["fcff"].replace([np.inf, -np.inf], np.nan)
-
-    first_five = data.head(5)
-
-    if first_five["fcff"].isna().any():
-        return np.nan
-
-    if (first_five["fcff"] <= 0).any():
-        return np.nan
-
-    ratios = first_five["fcff"].iloc[1:].to_numpy() / first_five["fcff"].iloc[:-1].to_numpy()
-
-    if not np.isfinite(ratios).all():
-        return np.nan
-
-    return np.prod(ratios) ** (1 / len(ratios)) - 1
+print(wacc_df)
