@@ -11,8 +11,7 @@ from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-#cfg (maybe put into sole file)
-
+#cfg
 load_dotenv()
 
 #change for new datasets after training
@@ -389,7 +388,7 @@ def get_metric_dataframe(
     df = df[keep_cols].dropna(subset=["filed", "end", "val"])
     df = df.sort_values(["end", "filed"]).drop_duplicates(subset=["end"], keep="last")
 
-    return df.sort_values("filed").reset_index(drop=True)
+    return df.sort_values("end").reset_index(drop=True)
 
 
 def get_metric_dataframe_multi(
@@ -414,19 +413,13 @@ def get_metric_dataframe_multi(
 
     return pd.DataFrame()
 
+
 def extract_fundamentals(facts: dict) -> pd.DataFrame | None:
     """
     Input: get_company_facts function's yield
     Output: DataFrame of following fundamentals for a full-available time-horizon
     """
     metric_map = {
-        "ebit": (
-            (
-                "OperatingIncomeLoss",
-                "IncomeLossFromOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
-            ),
-            ("USD",),
-        ),
         "equity": (
             (
                 "StockholdersEquity",
@@ -440,6 +433,9 @@ def extract_fundamentals(facts: dict) -> pd.DataFrame | None:
                 "DebtAndCapitalLeaseObligations",
                 "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
                 "LongTermDebtAndFinanceLeaseObligationsIncludingCurrentMaturities",
+                "LongTermDebtCurrentAndNoncurrent",
+                "LongTermDebtAndShortTermBorrowings",
+                "ShortTermAndLongTermDebt",
             ),
             ("USD",),
         ),
@@ -449,6 +445,11 @@ def extract_fundamentals(facts: dict) -> pd.DataFrame | None:
                 "LongTermDebtNoncurrent",
                 "LongTermDebtAndCapitalLeaseObligations",
                 "LongTermDebtAndFinanceLeaseObligations",
+                "LongTermDebtAndCapitalLeaseObligationsNoncurrent",
+                "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
+                "NotesPayableNoncurrent",
+                "FinanceLeaseLiabilityNoncurrent",
+                "OperatingLeaseLiabilityNoncurrent",
             ),
             ("USD",),
         ),
@@ -460,6 +461,10 @@ def extract_fundamentals(facts: dict) -> pd.DataFrame | None:
                 "CurrentPortionOfLongTermDebt",
                 "CurrentPortionOfLongTermDebtAndCapitalLeaseObligations",
                 "CurrentPortionOfLongTermDebtAndFinanceLeaseObligations",
+                "NotesPayableCurrent",
+                "FinanceLeaseLiabilityCurrent",
+                "OperatingLeaseLiabilityCurrent",
+                "CommercialPaper",
             ),
             ("USD",),
         ),
@@ -498,29 +503,36 @@ def extract_fundamentals(facts: dict) -> pd.DataFrame | None:
         if metric_df.empty:
             continue
 
-        metric_df = metric_df[["filed", "end", "val"]].rename(columns={"val": out_name})
+        metric_df = metric_df[["filed", "end", "val"]].rename(columns={"filed": f"filed_{out_name}", "val": out_name})
 
         if merged is None:
             merged = metric_df
         else:
-            merged = merged.merge(metric_df, on=["filed", "end"], how="outer")
+            merged = merged.merge(metric_df, on=["end"], how="outer")
 
     if merged is None or merged.empty:
         return None
 
-    merged["filed"] = pd.to_datetime(merged["filed"], errors="coerce").astype("datetime64[ns]")
     merged["end"] = pd.to_datetime(merged["end"], errors="coerce").astype("datetime64[ns]")
 
-    merged = merged.sort_values(["filed", "end"]).reset_index(drop=True)
+    filed_cols = [c for c in merged.columns if c.startswith("filed_")]
+    if filed_cols:
+        merged[filed_cols] = merged[filed_cols].apply(pd.to_datetime, errors="coerce")
+        merged["filed"] = merged[filed_cols].max(axis=1)
+        merged = merged.drop(columns=filed_cols)
+
+    merged = merged.sort_values(["end", "filed"]).reset_index(drop=True)
 
     value_cols = [c for c in merged.columns if c not in ("filed", "end")]
-    min_non_na = max(1, int(len(value_cols) * 0.5))
-    merged = merged[merged[value_cols].notna().sum(axis=1) >= min_non_na]
+    merged = merged.dropna(subset=["filed", "end"], how="any")
+
+    if value_cols:
+        merged = merged[merged[value_cols].notna().sum(axis=1) >= 1]
 
     if merged.empty:
         return None
 
-    merged = merged.sort_values(["filed", "end"]).drop_duplicates(subset=["filed"], keep="last")
+    merged = merged.sort_values(["end", "filed"]).drop_duplicates(subset=["end"], keep="last")
     return merged.reset_index(drop=True)
 
 
@@ -555,12 +567,14 @@ def merge_fundamentals_asof(price_df: pd.DataFrame, fund_df: pd.DataFrame) -> pd
     merged.index.name = "Date"
     return merged
 
+
 def add_valuation_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Input: joined market and fundamental DataFrame
     Output: DataFrame with columns dedicated to valuation(Net_Debt, EV, FCFF, Market Cap)
     """
     df = df.copy()
+
     def as_series(value, index):
         if isinstance(value, pd.Series):
             return pd.to_numeric(value, errors="coerce").reindex(index)
@@ -570,14 +584,17 @@ def add_valuation_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     price = as_series(df.get("price"), df.index)
     shares = as_series(df.get("shares_yf"), df.index)
-    cash = as_series(df.get("cash"), df.index).fillna(0.0)
+    cash = as_series(df.get("cash"), df.index)
     total_debt = as_series(df.get("total_debt"), df.index)
     long_term_debt = as_series(df.get("long_term_debt"), df.index)
     short_term_debt = as_series(df.get("short_term_debt"), df.index)
+
     df["market_cap"] = price * shares
 
-    #If total_debt is empty -> total_debt = long term + short term
+    has_debt_parts = long_term_debt.notna() | short_term_debt.notna()
     debt_parts = long_term_debt.fillna(0.0) + short_term_debt.fillna(0.0)
+    debt_parts = debt_parts.where(has_debt_parts, np.nan)
+
     df["total_debt"] = total_debt.where(total_debt.notna(), debt_parts)
     df["net_debt"] = df["total_debt"] - cash
 
