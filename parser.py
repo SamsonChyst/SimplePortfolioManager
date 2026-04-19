@@ -44,7 +44,6 @@ def safe_str(x):
     s = str(x).strip()
     return s if s else None
 
-
 def load_companies(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, usecols=["ticker", "industry"])
 
@@ -210,16 +209,36 @@ def compute_returns(df: pd.DataFrame) -> pd.DataFrame:
 def compute_volatility(df: pd.DataFrame, window: int = 21) -> pd.DataFrame:
     """
     Input: Log-returns dataframe, rolling window
-    Output: Computes 21d Variance Coefficient of log-returns
+    Output: Computes 21d standard deviation of log-returns
     """
     df = df.copy()
     roll_std = df["ret"].rolling(window=window, min_periods=2).std()
-    roll_mean = df["ret"].rolling(window=window, min_periods=2).mean()
 
-    df["volatility_21d"] = ((roll_std / roll_mean).abs()) * 100
+    df["volatility_21d"] = (roll_std).abs()
     df["volatility_21d"] = df["volatility_21d"].replace([np.inf, -np.inf], np.nan)
     return df
 
+def compute_market_regime_features(
+    df: pd.DataFrame,
+    momentum_window: int = 21,
+    ma_window: int = 21,
+) -> pd.DataFrame:
+    """
+    Input: DataFrame with 'market_price'
+    Output: Adds market momentum and deviation from moving average
+    """
+    df = df.copy()
+    # Momentum
+    df["market_momentum"] = (
+        df["market_price"] / df["market_price"].shift(momentum_window) - 1
+    )
+    # Deviation from moving average
+    ma = df["market_price"].rolling(window=ma_window, min_periods=5).mean()
+    df["market_deviation"] = df["market_price"] / ma - 1
+
+    df["market_momentum"] = df["market_momentum"].replace([np.inf, -np.inf], np.nan)
+    df["market_deviation"] = df["market_deviation"].replace([np.inf, -np.inf], np.nan)
+    return df
 
 def compute_log_volume(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -638,6 +657,7 @@ def process_ticker(
         df = compute_beta(df)
         df = compute_volatility(df)
         df = compute_log_volume(df)
+        df = compute_market_regime_features(df)
 
         shares_df = get_yf_shares_series(ticker, start=start_date, end=end_date)
         if not shares_df.empty:

@@ -1,156 +1,26 @@
-import pandas as pd
-import json
-import os
-import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
+from functools import lru_cache
+from dataset_processor import *
+import numpy as np
+from scipy import stats
+from scipy import optimize
+import matplotlib.pyplot as plt
+import pandas as pd
 
 #cfg
-
-ds = os.listdir("Datasets/tickers/") #Directory with parquets for every TICKER
 
 INPUT_CSV = Path("Datasets/US_WaccComponents_Timeseries.csv") #For US Market
 #Source: Risk-free rates and equity premium Stern-Damodaran,
 #Marginal tax rates - IRS, Annual AVG Credit Spreads - BBB OAS
 
+_WACC_TABLE = pd.read_csv(INPUT_CSV, sep=";", header=0, index_col="Year")
 
-#DataFrame processing
 
 @dataclass(frozen=True)
 class ValuationKey:
     ticker: str
     valuation_year: int
-
-
-def _load_ticker_df(ticker: str) -> pd.DataFrame:
-    return pd.read_parquet(f"Datasets/tickers/{ticker}/timeseries.parquet")
-
-
-def time_slicing(
-        ticker: str,
-        start_year: int,
-        end_year: int,
-        shift: int = 5,
-) -> pd.DataFrame:
-    """
-    Input: Valid Ticker existing in Dataset, Start & End year, Shift-days after filing date
-    Output: A sliced DataFrame by real date
-    """
-    if shift < 0:
-        raise ValueError("shift must be >= 0")
-
-    df = _load_ticker_df(ticker).copy()
-
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("DataFrame index must be DatetimeIndex")
-
-    if "filing_date" not in df.columns:
-        raise ValueError("DataFrame must contain 'filing_date' column")
-
-    df = df.sort_index()
-    df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce")
-
-    def get_boundary(year: int) -> pd.Timestamp | None:
-        base_date = pd.Timestamp(year=year, month=1, day=1)
-
-        candidates = df.loc[df.index >= base_date]
-        if candidates.empty:
-            return None
-
-        first_row = candidates.iloc[0]
-        filing_date = first_row["filing_date"]
-
-        if pd.isna(filing_date):
-            return None
-
-        min_valid_date = filing_date + pd.Timedelta(days=shift)
-
-        valid = candidates.loc[candidates.index >= min_valid_date]
-        if valid.empty:
-            return None
-
-        return valid.index[0]
-
-    start_date = get_boundary(start_year)
-    end_exclusive = get_boundary(end_year + 1)
-
-    if start_date is None:
-        return pd.DataFrame()
-
-    if end_exclusive is None:
-        return df.loc[start_date:].copy()
-
-    return df.loc[(df.index >= start_date) & (df.index < end_exclusive)].copy()
-
-
-def year_slicing(ticker: str, start_year: int, end_year: int, shift: int = 5) -> pd.DataFrame:
-    """
-    Input: ticker, start and end decision years, shift-days after filing date
-    Output: one row per year at the first valid real date
-    """
-    if shift < 0:
-        raise ValueError("shift must be >= 0")
-
-    df = _load_ticker_df(ticker).copy()
-
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("DataFrame index must be DatetimeIndex")
-
-    if "filing_date" not in df.columns:
-        raise ValueError("DataFrame must contain 'filing_date' column")
-
-    df = df.sort_index()
-    df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce")
-
-    rows = []
-
-    for year in range(start_year, end_year + 1):
-        base_date = pd.Timestamp(year=year, month=1, day=1)
-
-        year_slice = df[df.index >= base_date]
-        if year_slice.empty:
-            continue
-
-        first_row = year_slice.iloc[0]
-        filing_date = first_row["filing_date"]
-
-        if pd.isna(filing_date):
-            continue
-
-        min_valid_date = filing_date + pd.Timedelta(days=shift)
-
-        if first_row.name >= min_valid_date:
-            chosen = first_row.copy()
-        else:
-            valid_rows = year_slice[year_slice.index >= min_valid_date]
-            if valid_rows.empty:
-                continue
-            chosen = valid_rows.iloc[0].copy()
-
-        chosen["decision_year"] = year
-        chosen["decision_date"] = chosen.name
-        rows.append(chosen)
-
-    if not rows:
-        return pd.DataFrame()
-
-    return pd.DataFrame(rows)
-
-
-def has_fundamentals(ticker: str) -> bool: #1700+ as of last input dataset
-    """
-    Input: Ticker
-    Output: Whether meta.json says has_fundamentals == True
-    """
-    df_path = f"Datasets/tickers/{ticker}/meta.json"
-
-    if not os.path.exists(df_path):
-        return False
-    with open(df_path, "r", encoding="utf-8") as f:
-        meta_data = json.load(f)
-
-    return bool(meta_data.get("has_fundamentals", False))
-
 
 #Valuation
 
@@ -182,38 +52,30 @@ def dcf_proxy(
 
     for col in [
         "price", "ev", "fcff", "net_debt", "total_debt",
-        "long_term_debt", "short_term_debt", "market_cap",
-        "market_price", "cash", "equity", "shares_yf"
+        "market_cap", "market_price", "cash", "shares_yf"
     ]:
         if col in data.columns:
             data[col] = pd.to_numeric(data[col], errors="coerce")
         else:
             data[col] = np.nan
 
-    implied_net_debt = data["ev"] - data["market_cap"]
-    implied_scale = pd.concat(
-        [
-            data["ev"].abs(),
-            data["market_cap"].abs(),
-            pd.Series(1.0, index=data.index)
-        ],
-        axis=1
-    ).max(axis=1)
-    implied_ratio = implied_net_debt.abs() / implied_scale
-    implied_net_debt = implied_net_debt.where(implied_ratio > net_debt_radius, 0.0)
+    if data["net_debt"].isna().any():
+        fallback_from_balance = data["total_debt"] - data["cash"]
+        data["net_debt"] = data["net_debt"].where(data["net_debt"].notna(), fallback_from_balance)
 
-    has_debt_parts = data["long_term_debt"].notna() | data["short_term_debt"].notna()
-    debt_parts = data["long_term_debt"].fillna(0.0) + data["short_term_debt"].fillna(0.0)
-    debt_parts = debt_parts.where(has_debt_parts, np.nan)
+    if data["net_debt"].isna().any():
+        implied_net_debt = data["ev"] - data["market_cap"]
+        implied_scale = np.maximum.reduce([
+            data["ev"].abs().fillna(0.0).to_numpy(dtype=float),
+            data["market_cap"].abs().fillna(0.0).to_numpy(dtype=float),
+            np.ones(len(data), dtype=float)
+        ])
+        implied_ratio = np.abs(implied_net_debt.to_numpy(dtype=float)) / implied_scale
+        implied_net_debt = implied_net_debt.where(implied_ratio > net_debt_radius, 0.0)
 
-    fallback_balance = debt_parts - data["cash"]
+        data["net_debt"] = data["net_debt"].where(data["net_debt"].notna(), implied_net_debt)
 
-    data["total_debt"] = data["total_debt"].where(data["total_debt"].notna(), debt_parts)
-    data["net_debt"] = data["net_debt"].where(pd.notna(data["net_debt"]), data["total_debt"] - data["cash"])
-    data["net_debt"] = data["net_debt"].where(pd.notna(data["net_debt"]), fallback_balance)
-    data["net_debt"] = data["net_debt"].where(pd.notna(data["net_debt"]), implied_net_debt)
-
-    hist = data.iloc[:5].copy()
+    hist = data.iloc[:5]
     comp = data.iloc[5]
 
     fcff_positive = hist.loc[hist["fcff"] > 0, "fcff"]
@@ -236,7 +98,7 @@ def dcf_proxy(
     market_price_6 = comp["market_price"]
 
     fcff_cagr = np.nan
-    fcff_hist = hist[[date_col, "fcff"]].dropna().copy()
+    fcff_hist = hist[[date_col, "fcff"]].dropna()
     fcff_hist = fcff_hist[fcff_hist["fcff"] > 0]
 
     if len(fcff_hist) >= 2:
@@ -253,20 +115,32 @@ def dcf_proxy(
             if year_gap <= 0:
                 continue
 
+            if prev_fcff <= 0 or curr_fcff <= 0:
+                continue
+
             growth = (curr_fcff / prev_fcff) ** (1 / year_gap) - 1
             if pd.notna(growth) and np.isfinite(growth):
                 yoy_growth.append(growth)
 
-        if yoy_growth:
+        if len(yoy_growth) > 0:
             fcff_cagr = float(np.median(yoy_growth))
         else:
-            x = (fcff_hist[date_col] - fcff_hist[date_col].min()).dt.days / 365.25
-            y = np.log(fcff_hist["fcff"].values)
-            if len(x) >= 2:
-                slope = np.polyfit(x - x.mean(), y, 1)[0]
-                fcff_cagr = np.exp(slope) - 1
+            x = ((fcff_hist[date_col] - fcff_hist[date_col].min()).dt.days / 365.25).to_numpy(dtype=float)
+            y = np.log(fcff_hist["fcff"].to_numpy(dtype=float))
+            mask = np.isfinite(x) & np.isfinite(y)
 
-    if pd.notna(fcff_cagr):
+            x = x[mask]
+            y = y[mask]
+
+            if len(x) >= 2 and np.ptp(x) > 0:
+                try:
+                    slope = np.polyfit(x - x.mean(), y, 1)[0]
+                    if np.isfinite(slope):
+                        fcff_cagr = np.exp(slope) - 1
+                except Exception:
+                    fcff_cagr = np.nan
+
+    if pd.notna(fcff_cagr) and np.isfinite(fcff_cagr):
         fcff_cagr = 0.15 * np.tanh(fcff_cagr / 0.15)
 
     real_price_change = np.nan
@@ -300,11 +174,25 @@ def wacc_proxy(ticker: str, valuation_year: int) -> float:
     """
     key = ValuationKey(ticker=ticker, valuation_year=valuation_year)
 
-    WaccDf = pd.read_csv(INPUT_CSV, sep=";", header=0, index_col="Year").loc[key.valuation_year, :]
+    if key.valuation_year not in _WACC_TABLE.index:
+        return np.nan
+
+    WaccDf = _WACC_TABLE.loc[key.valuation_year, :]
     DailyDf = time_slicing(key.ticker, key.valuation_year - 4, key.valuation_year)
     YearlySeries = dcf_proxy(year_slicing(key.ticker, key.valuation_year - 4, key.valuation_year + 1))
 
-    beta = float(np.median(DailyDf["beta_ewm"].dropna()))
+    if DailyDf is None or DailyDf.empty:
+        return np.nan
+
+    if "beta_ewm" not in DailyDf.columns:
+        return np.nan
+
+    beta_series = pd.to_numeric(DailyDf["beta_ewm"], errors="coerce").dropna()
+    if beta_series.empty:
+        return np.nan
+
+    beta = float(beta_series.median())
+
     risk_free = float(WaccDf["T_Bond_Rate"])
     equity_premium = float(WaccDf["Implied_ERP_(FCFE)"])
     cost_of_capital = (risk_free + beta * equity_premium)
@@ -312,6 +200,9 @@ def wacc_proxy(ticker: str, valuation_year: int) -> float:
     tax_shield = 1 - float(WaccDf["US_Marginal_Tax_Rate"])
 
     total_capital = YearlySeries["market_cap_5"] + YearlySeries["total_debt_5"]
+    if pd.isna(total_capital) or total_capital <= 0:
+        return np.nan
+
     equity_in_structure = YearlySeries["market_cap_5"] / total_capital
     debt_in_structure = YearlySeries["total_debt_5"] / total_capital
 
@@ -328,11 +219,8 @@ def dcf_valuation(
         growth_rate: float = 0.0275,
         terminal_growth_rate: float = 0.01375,
         shift: int = 5,
+        min_wacc_terminal_spread: float = 0.03,
 ) -> pd.Series:
-    """
-    Input: ticker and valuation year
-    Output: FCFF DCF valuation with Enterprise Value, Equity Value and value per share
-    """
     key = ValuationKey(ticker=ticker, valuation_year=valuation_year)
 
     yearly_df = year_slicing(
@@ -361,23 +249,16 @@ def dcf_valuation(
     if not np.isfinite(wacc):
         return pd.Series(dtype="float64")
 
-    if terminal_growth_rate >= wacc:
-        terminal_growth_rate = min(growth_rate / 2, wacc - 0.01)
-
-    if terminal_growth_rate >= wacc:
+    spread = wacc - terminal_growth_rate
+    if not np.isfinite(spread) or spread <= min_wacc_terminal_spread:
         return pd.Series(dtype="float64")
 
-    fcff_forecast = []
-    pv_fcff = []
-
-    for t in range(1, forecast_years + 1):
-        fcff_t = fcff_0 * ((1 + growth_rate) ** t)
-        pv_t = fcff_t / ((1 + wacc) ** t)
-        fcff_forecast.append(fcff_t)
-        pv_fcff.append(pv_t)
+    t = np.arange(1, forecast_years + 1, dtype=float)
+    fcff_forecast = fcff_0 * ((1 + growth_rate) ** t)
+    pv_fcff = fcff_forecast / ((1 + wacc) ** t)
 
     fcff_terminal_base = fcff_forecast[-1]
-    terminal_value = (fcff_terminal_base * (1 + terminal_growth_rate)) / (wacc - terminal_growth_rate)
+    terminal_value = (fcff_terminal_base * (1 + terminal_growth_rate)) / spread
     pv_terminal_value = terminal_value / ((1 + wacc) ** forecast_years)
 
     enterprise_value = float(np.sum(pv_fcff) + pv_terminal_value)
@@ -410,5 +291,306 @@ def dcf_valuation(
 
     return pd.Series(result)
 
-#MAYBE I SHOULD CREATE 2 MARKERS 1-DCF SIGN(VECTOR GROWTH/DECLINE) 2-REAL ALPHA AND NORM BOTH OF THEM
-#AFTER ML I SHOULD FILTER OUTCOMES TO MY TASTE CONSIDERING BOTH AXIS
+
+def target_row(
+        ticker: str,
+        valuation_year: int,
+        forecast_years: int = 5,
+        growth_rate: float = 0.0275,
+        terminal_growth_rate: float = 0.01375,
+        shift: int = 5,
+) -> pd.Series:
+    """
+    Input: ticker and valuation year
+    Output: one-row target observation for dataset construction
+    """
+    val = dcf_valuation(
+        ticker=ticker,
+        valuation_year=valuation_year,
+        forecast_years=forecast_years,
+        growth_rate=growth_rate,
+        terminal_growth_rate=terminal_growth_rate,
+        shift=shift,
+    )
+
+    if val is None or len(val) == 0:
+        return pd.Series(dtype="float64")
+
+    implied_upside = pd.to_numeric(val.get("implied_upside"), errors="coerce")
+    real_upside = pd.to_numeric(val.get("real_upside"), errors="coerce")
+    market_upside = pd.to_numeric(val.get("market_upside"), errors="coerce")
+
+    if pd.isna(implied_upside) or not np.isfinite(implied_upside):
+        return pd.Series(dtype="float64")
+
+    if pd.isna(real_upside) or not np.isfinite(real_upside):
+        return pd.Series(dtype="float64")
+
+    if pd.isna(market_upside) or not np.isfinite(market_upside):
+        return pd.Series(dtype="float64")
+
+    real_alpha = real_upside - market_upside
+
+    if pd.isna(real_alpha) or not np.isfinite(real_alpha):
+        return pd.Series(dtype="float64")
+
+    return pd.Series({
+        "ticker": ticker,
+        "valuation_year": int(valuation_year),
+        "real_alpha": float(real_alpha),
+        "implied_upside": float(implied_upside),
+    })
+
+#ML Label is copula-based upon Bayesian P(real_alpha | DCF_signal)
+#Copula based Labelling
+
+def clean_copula_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Input: a DataFrame after load_train_jsons
+    Output: a filtered DataFrame, without Nans & infinities
+    """
+    out = df.copy()
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out = out.dropna(subset=["implied_upside", "real_alpha"])
+
+    out["implied_upside"] = pd.to_numeric(out["implied_upside"], errors="coerce")
+    out["real_alpha"] = pd.to_numeric(out["real_alpha"], errors="coerce")
+
+    out = out.dropna(subset=["implied_upside", "real_alpha"])
+
+    out = out.drop_duplicates(subset=["ticker", "valuation_year"])
+
+    return out.reset_index(drop=True)
+
+
+def marginal_diagnostics(x: pd.Series) -> dict:
+    arr = np.asarray(x, dtype=float)
+    return {
+        "n": len(arr),
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr, ddof=1)),
+        "min": float(np.min(arr)),
+        "q01": float(np.quantile(arr, 0.01)),
+        "q05": float(np.quantile(arr, 0.05)),
+        "median": float(np.median(arr)),
+        "q95": float(np.quantile(arr, 0.95)),
+        "q99": float(np.quantile(arr, 0.99)),
+        "max": float(np.max(arr)),
+        "skew": float(stats.skew(arr, bias=False)),
+        "kurtosis_excess": float(stats.kurtosis(arr, fisher=True, bias=False)),
+    }
+
+def prepare_copula_dataset(train_dir: str = "Datasets/train/") -> pd.DataFrame:
+    """
+    Input: directory of the train Dataset
+    Output: clean DataFrame with empirical observations for copula modeling
+    """
+    df = load_train_jsons(train_dir)
+    df = clean_copula_dataset(df)
+
+    if df.empty:
+        raise ValueError("Dataset is empty after cleaning.")
+    out = df.copy()
+    a = np.asarray(out["real_alpha"], dtype=float)
+    d = np.asarray(out["implied_upside"], dtype=float)
+    n = len(out)
+
+    out["u_A"] = stats.rankdata(a, method="average") / (n + 1.0)
+    out["v_D"] = stats.rankdata(d, method="average") / (n + 1.0)
+    return out
+
+
+@lru_cache(maxsize=4)
+def _cached_copula_arrays(train_dir: str = "Datasets/train/"):
+    df = prepare_copula_dataset(train_dir=train_dir)
+
+    alpha_sample = np.sort(df["real_alpha"].dropna().to_numpy(dtype=float))
+    dcf_sample = np.sort(df["implied_upside"].dropna().to_numpy(dtype=float))
+
+    return alpha_sample, dcf_sample
+
+
+def _copula_uv(df: pd.DataFrame, u_col: str = "u_A", v_col: str = "v_D", eps: float = 1e-12):
+    """
+    Input: prepared copula DataFrame with pseudo-observations
+    Output: clipped numpy arrays u and v for copula likelihood evaluation
+    """
+    if df is None or df.empty:
+        raise ValueError("Prepared copula dataset is empty.")
+    if u_col not in df.columns or v_col not in df.columns:
+        raise ValueError(f"Columns '{u_col}' and '{v_col}' must exist in DataFrame.")
+
+    u = pd.to_numeric(df[u_col], errors="coerce").to_numpy(dtype=float)
+    v = pd.to_numeric(df[v_col], errors="coerce").to_numpy(dtype=float)
+
+    mask = np.isfinite(u) & np.isfinite(v)
+    u = u[mask]
+    v = v[mask]
+
+    if len(u) == 0:
+        raise ValueError("No valid pseudo-observations found.")
+
+    u = np.clip(u, eps, 1.0 - eps)
+    v = np.clip(v, eps, 1.0 - eps)
+    return u, v
+
+
+def clayton_log_density(u: np.ndarray, v: np.ndarray, theta: float) -> np.ndarray:
+    """
+    Input: pseudo-observations u and v, and Clayton dependence parameter theta
+    Output: pointwise log-density values of the Clayton copula used for canonical max-likelihood
+
+    Clayton copula was chosen because it produced the best fit among tested families.
+    In the model comparison it had the strongest information criteria:
+    loglik = 18.8832, AIC = -35.7664, BIC = -30.9174, tau = 0.1063(the biggest out of others)
+    which were better than Student-t, Gaussian, Gumbel, and Frank alternatives.
+    """
+    if not np.isfinite(theta) or theta <= 0.0:
+        return np.full_like(u, -np.inf, dtype=float)
+
+    s = np.power(u, -theta) + np.power(v, -theta) - 1.0
+    if np.any(s <= 0):
+        return np.full_like(u, -np.inf, dtype=float)
+
+    logc = (
+        np.log1p(theta)
+        + (-theta - 1.0) * (np.log(u) + np.log(v))
+        + (-2.0 - 1.0 / theta) * np.log(s)
+    )
+    return logc
+
+
+def clayton_copula_loglik(u: np.ndarray, v: np.ndarray, theta: float) -> float:
+    """
+    Input: pseudo-observations u and v, and Clayton dependence parameter theta
+    Output: total log-likelihood of the Clayton copula
+    """
+    logc = clayton_log_density(u, v, theta)
+    if not np.all(np.isfinite(logc)):
+        return -np.inf
+    return float(np.sum(logc))
+
+
+def clayton_CMLE(train_dir: str = "Datasets/train/") -> dict:
+    """
+    Input: prepared copula DataFrame with empirical pseudo-observations
+    Output: fitted Clayton copula parameters and fit statistics via canonical maximum likelihood
+
+    For the presented US 2010-2025 stock dataset theta parameter = 0.27768293199105604
+    """
+    df = prepare_copula_dataset(train_dir=train_dir)
+
+    u, v = _copula_uv(df, "u_A", "v_D")
+
+    tau = stats.kendalltau(u, v, nan_policy="omit").statistic
+    if tau is None or not np.isfinite(tau):
+        theta0 = 1.0
+    else:
+        tau = float(np.clip(tau, 1e-4, 0.95))
+        theta0 = max(2.0 * tau / (1.0 - tau), 1e-3)
+
+    def objective(x):
+        theta = float(x[0])
+        ll = clayton_copula_loglik(u, v, theta)
+        if not np.isfinite(ll):
+            return np.inf
+        return -ll
+
+    res = optimize.minimize(
+        objective,
+        x0=np.array([theta0], dtype=float),
+        method="L-BFGS-B",
+        bounds=[(1e-6, 200.0)],
+    )
+
+    theta_hat = float(res.x[0])
+    loglik = clayton_copula_loglik(u, v, theta_hat)
+    k = 1
+    n = len(u)
+    aic = 2 * k - 2 * loglik
+    bic = np.log(n) * k - 2 * loglik
+    tau_hat = theta_hat / (theta_hat + 2.0)
+
+    return {
+        "family": "clayton",
+        "success": bool(res.success),
+        "message": str(res.message),
+        "n": int(n),
+        "k": int(k),
+        "theta": float(theta_hat),
+        "kendall_tau_implied": float(tau_hat),
+        "loglik": float(loglik),
+        "aic": float(aic),
+        "bic": float(bic),
+    }
+
+def label_maker(
+        dcf_signal: float,
+        grid_size: int = 1000,
+        eps: float = 1e-6
+) -> pd.Series:
+    """
+    Input: DCF signal
+    Output: pandas.Series with:  Probability alpha > 0 | DCF = const, expected_alpha
+    """
+    train_dir = "Datasets/train/"
+    theta = clayton_CMLE()['theta']
+
+    if pd.isna(dcf_signal) or not np.isfinite(dcf_signal):
+        return pd.Series(dtype="float64")
+
+    alpha_sample, dcf_sample = _cached_copula_arrays(train_dir=train_dir)
+
+    if len(alpha_sample) == 0 or len(dcf_sample) == 0:
+        return pd.Series(dtype="float64")
+
+    v = np.searchsorted(dcf_sample, dcf_signal, side="right") / (len(dcf_sample) + 1.0)
+    v = float(np.clip(v, eps, 1 - eps))
+
+    u0 = np.searchsorted(alpha_sample, 0.0, side="right") / (len(alpha_sample) + 1.0)
+    u0 = float(np.clip(u0, eps, 1 - eps))
+
+    s0 = (u0 ** (-theta) + v ** (-theta) - 1.0)
+    h0 = (v ** (-theta - 1.0)) * (s0 ** (-1.0 / theta - 1.0))
+    p_alpha_gt_0 = float(np.clip(1.0 - h0, 0.0, 1.0))
+
+    u_grid = np.linspace(eps, 1 - eps, grid_size)
+
+    probs = np.arange(1, len(alpha_sample) + 1) / (len(alpha_sample) + 1.0)
+    alpha_grid = np.interp(u_grid, probs, alpha_sample)
+
+    s = (u_grid ** (-theta) + v ** (-theta) - 1.0)
+    density = (
+        (1.0 + theta)
+        * (u_grid ** (-theta - 1.0))
+        * (v ** (-theta - 1.0))
+        * (s ** (-2.0 - 1.0 / theta))
+    )
+
+    density = np.maximum(density, 0.0)
+
+    mass = np.trapezoid(density, u_grid)
+    if not np.isfinite(mass) or mass <= 0:
+        return pd.Series(dtype="float64")
+
+    density /= mass
+    expected_alpha = float(np.trapezoid(alpha_grid * density, u_grid))
+
+    return pd.Series({
+        "P(alpha > 0)": p_alpha_gt_0,
+        "E(alpha)": expected_alpha,
+    })
+
+#Notes
+'''
+When |D| falls within the [0.38 – 1.22] range, the probability of the implied share price
+and alpha sharing the same sign is >60%, peaking at 70.6%. This confirms that the correlation
+between magnitude and sign convergence is strongest at conventional DCF values. Conversely,
+accuracy drops to 49% for |D| in [0.21–0.38] and settles into a purely random or inverse
+distribution-45% at extremes (|D|>4.49)
+Though < 0.38 range can be also applicable due to real_upside-market_upside being negative,
+while both signs of implied and real upsides match
+    
+Result: we will only use (0 – 1.22] range for copula construction
+'''
