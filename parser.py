@@ -16,7 +16,7 @@ load_dotenv()
 
 #change for new datasets after training
 INPUT_CSV = Path("Datasets/companies.csv") #Source: Kaggle US Stocks & ETFs - Tickers, Company Info, Logos
-OUTPUT_DIR = Path("Datasets/tickers")
+OUTPUT_DIR = Path("Datasets/tickers") #2787 valid tickers
 
 #DataFrame slicing
 START_DATE = "2010-01-01"

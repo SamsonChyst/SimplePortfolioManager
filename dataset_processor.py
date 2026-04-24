@@ -6,6 +6,7 @@ import json
 def _load_ticker_df(ticker: str) -> pd.DataFrame:
     return pd.read_parquet(f"Datasets/tickers/{ticker}/timeseries.parquet")
 
+
 def has_fundamentals(ticker: str) -> bool: #1700+ as of last input dataset
     """
     Input: Ticker
@@ -19,6 +20,7 @@ def has_fundamentals(ticker: str) -> bool: #1700+ as of last input dataset
         meta_data = json.load(f)
 
     return bool(meta_data.get("has_fundamentals", False))
+
 
 def time_slicing(
         ticker: str,
@@ -130,6 +132,7 @@ def year_slicing(ticker: str, start_year: int, end_year: int, shift: int = 5) ->
 
     return pd.DataFrame(rows)
 
+#train dataset
 
 def load_train_jsons(train_dir: str = "Datasets/train/") -> pd.DataFrame:
     """
@@ -147,13 +150,54 @@ def load_train_jsons(train_dir: str = "Datasets/train/") -> pd.DataFrame:
                     obj = json.load(f)
 
                 rows.append({
-                    "ticker": obj.get("ticker"),
+                    "ticker":         obj.get("ticker"),
                     "valuation_year": obj.get("valuation_year"),
+                    "alpha_horizon":  obj.get("alpha_horizon"),
                     "implied_upside": obj.get("implied_upside"),
-                    "real_alpha": obj.get("real_alpha"),
+                    "real_alpha":     obj.get("real_alpha"),
+                    "t_bond_rate":    obj.get("t_bond_rate"),
                 })
             except Exception as e:
                 print(f"Failed to read {path}: {e}")
 
     df = pd.DataFrame(rows)
     return df
+
+
+def load_train_parquets(
+    train_dir: str = "Datasets/train/",
+    drop_index: bool = True,
+    add_ticker: bool = False,
+) -> pd.DataFrame:
+    """
+    Input: Directory of the train Dataset with parquet files (recursive through ticker folders)
+    Output: Combines all parquet datasets into one DataFrame
+    """
+    dfs = []
+
+    for root, dirs, files in os.walk(train_dir):
+        for fname in files:
+            if not fname.lower().endswith(".parquet"):
+                continue
+
+            path = os.path.join(root, fname)
+
+            try:
+                df = pd.read_parquet(path)
+
+                if add_ticker:
+                    ticker = os.path.basename(root)
+                    df["ticker"] = ticker
+
+                if drop_index:
+                    df = df.reset_index(drop=True)
+                else:
+                    df = df.reset_index()
+
+                dfs.append(df)
+
+            except Exception:
+                continue
+    if len(dfs) == 0:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
