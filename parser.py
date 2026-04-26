@@ -19,11 +19,11 @@ INPUT_CSV = Path("Datasets/companies.csv") #Source: Kaggle US Stocks & ETFs - Ti
 OUTPUT_DIR = Path("Datasets/tickers") #2787 valid tickers
 
 #DataFrame slicing
-START_DATE = "2010-01-01"
-END_DATE = "2026-01-01"
+START_DATE = "2016-01-01"
+END_DATE = "2026-03-31"
 
 #Data Fetching
-FETCH_START_DATE = "2009-01-01"
+FETCH_START_DATE = "2015-01-01"
 FETCH_END_DATE = "2027-01-01"
 
 MAX_WORKERS = 4

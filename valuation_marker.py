@@ -3,14 +3,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 from dataset_processor import *
 import numpy as np
-from scipy import stats
-from scipy import optimize
+from scipy import stats, optimize
 import pandas as pd
 
-# cfg
-INPUT_CSV = Path("Datasets/US_WaccComponents_Timeseries.csv")  # For US Market
-# Source: Risk-free rates and equity premium Stern-Damodaran,
-# Marginal tax rates - IRS, Annual AVG Credit Spreads - BBB OAS
+#cfg
+INPUT_CSV = Path("Datasets/US_WaccComponents_Timeseries.csv") #For US Market
+#Source: Risk-free rates and equity premium Stern-Damodaran,
+#Marginal tax rates - IRS, Annual AVG Credit Spreads - BBB OAS
 
 _WACC_TABLE = pd.read_csv(INPUT_CSV, sep=";", header=0, index_col="Year")
 
@@ -20,8 +19,7 @@ class ValuationKey:
     ticker: str
     valuation_year: int
 
-
-# Valuation
+#Valuation
 
 def dcf_proxy(
         df: pd.DataFrame,
@@ -74,7 +72,6 @@ def dcf_proxy(
         ])
         implied_ratio = np.abs(implied_net_debt.to_numpy(dtype=float)) / implied_scale
         implied_net_debt = implied_net_debt.where(implied_ratio > net_debt_radius, 0.0)
-
         data["net_debt"] = data["net_debt"].where(data["net_debt"].notna(), implied_net_debt)
 
     hist = data.iloc[:5]
@@ -89,15 +86,14 @@ def dcf_proxy(
 
     y5 = hist.loc[fcff_idx]
 
-    fcff_5 = y5["fcff"]
-    shares_5 = y5["shares_yf"]
-    price_5 = y5["price"]
-    net_debt_5 = y5["net_debt"]
-    total_debt_5 = y5["total_debt"]
-    market_cap_5 = y5["market_cap"]
+    fcff_5         = y5["fcff"]
+    shares_5       = y5["shares_yf"]
+    price_5        = y5["price"]
+    net_debt_5     = y5["net_debt"]
+    total_debt_5   = y5["total_debt"]
+    market_cap_5   = y5["market_cap"]
     market_price_5 = y5["market_price"]
-
-    price_comp = comp["price"]
+    price_comp        = comp["price"]
     market_price_comp = comp["market_price"]
 
     fcff_cagr = np.nan
@@ -117,7 +113,6 @@ def dcf_proxy(
             year_gap = (curr_date - prev_date).days / 365.25
             if year_gap <= 0:
                 continue
-
             if prev_fcff <= 0 or curr_fcff <= 0:
                 continue
 
@@ -131,7 +126,6 @@ def dcf_proxy(
             x = ((fcff_hist[date_col] - fcff_hist[date_col].min()).dt.days / 365.25).to_numpy(dtype=float)
             y = np.log(fcff_hist["fcff"].to_numpy(dtype=float))
             mask = np.isfinite(x) & np.isfinite(y)
-
             x = x[mask]
             y = y[mask]
 
@@ -155,18 +149,18 @@ def dcf_proxy(
         real_market_price_change = (market_price_comp / market_price_5) - 1
 
     return pd.Series({
-        "fcff": fcff_5,
-        "fcff_cagr": fcff_cagr,
-        "shares_5": shares_5,
-        "price_5": price_5,
-        "price_comp": price_comp,
-        "real_price_change": real_price_change,
-        "net_debt_5": net_debt_5,
-        "market_price_5": market_price_5,
-        "market_price_comp": market_price_comp,
+        "fcff":                    fcff_5,
+        "fcff_cagr":               fcff_cagr,
+        "shares_5":                shares_5,
+        "price_5":                 price_5,
+        "price_comp":              price_comp,
+        "real_price_change":       real_price_change,
+        "net_debt_5":              net_debt_5,
+        "market_price_5":          market_price_5,
+        "market_price_comp":       market_price_comp,
         "real_market_price_change": real_market_price_change,
-        "total_debt_5": total_debt_5,
-        "market_cap_5": market_cap_5
+        "total_debt_5":            total_debt_5,
+        "market_cap_5":            market_cap_5,
     })
 
 
@@ -180,13 +174,12 @@ def wacc_proxy(ticker: str, valuation_year: int) -> float:
     if key.valuation_year not in _WACC_TABLE.index:
         return np.nan
 
-    WaccDf = _WACC_TABLE.loc[key.valuation_year, :]
-    DailyDf = time_slicing(key.ticker, key.valuation_year - 4, key.valuation_year)
+    WaccDf      = _WACC_TABLE.loc[key.valuation_year, :]
+    DailyDf     = time_slicing(key.ticker, key.valuation_year - 4, key.valuation_year)
     YearlySeries = dcf_proxy(year_slicing(key.ticker, key.valuation_year - 4, key.valuation_year + 1))
 
     if DailyDf is None or DailyDf.empty:
         return np.nan
-
     if "beta_ewm" not in DailyDf.columns:
         return np.nan
 
@@ -196,23 +189,52 @@ def wacc_proxy(ticker: str, valuation_year: int) -> float:
 
     beta = float(beta_series.median())
 
-    risk_free = float(WaccDf["T_Bond_Rate"])
+    risk_free      = float(WaccDf["T_Bond_Rate"])
     equity_premium = float(WaccDf["Implied_ERP_(FCFE)"])
-    cost_of_capital = (risk_free + beta * equity_premium)
-
-    tax_shield = 1 - float(WaccDf["US_Marginal_Tax_Rate"])
+    cost_of_capital = risk_free + beta * equity_premium
+    tax_shield      = 1 - float(WaccDf["US_Marginal_Tax_Rate"])
 
     total_capital = YearlySeries["market_cap_5"] + YearlySeries["total_debt_5"]
     if pd.isna(total_capital) or total_capital <= 0:
         return np.nan
 
     equity_in_structure = YearlySeries["market_cap_5"] / total_capital
-    debt_in_structure = YearlySeries["total_debt_5"] / total_capital
-
-    credit_spread = float(WaccDf["Credit_Spread"])
-    cost_of_debt = risk_free + credit_spread
+    debt_in_structure   = YearlySeries["total_debt_5"]  / total_capital
+    credit_spread       = float(WaccDf["Credit_Spread"])
+    cost_of_debt        = risk_free + credit_spread
 
     return (equity_in_structure * cost_of_capital) + (debt_in_structure * cost_of_debt * tax_shield)
+
+
+def get_market_3y_return(ticker: str, valuation_year: int) -> float | None:
+    """
+    Input: Ticker and Valuation year
+    Output: 3Y CAGR of S&P 500 prior to valuation date
+    """
+    try:
+        df = time_slicing(ticker, valuation_year - 4, valuation_year)
+        if df is None or df.empty or "market_price" not in df.columns:
+            return None
+
+        df = df[["market_price"]].dropna().sort_index()
+        if len(df) < 2:
+            return None
+
+        price_end   = df["market_price"].iloc[-1]
+        price_start = df["market_price"].iloc[0]
+
+        if price_start <= 0 or not np.isfinite(price_start):
+            return None
+
+        years = (df.index[-1] - df.index[0]).days / 365.25
+        if years < 1.0:
+            return None
+
+        cagr = (price_end / price_start) ** (3.0 / years) - 1.0
+        return float(cagr) if np.isfinite(cagr) else None
+
+    except Exception:
+        return None
 
 
 def dcf_valuation(
@@ -222,7 +244,7 @@ def dcf_valuation(
         growth_rate: float = 0.0275,
         terminal_growth_rate: float = 0.01375,
         shift: int = 5,
-        alpha_horizon: int = 3,
+        alpha_horizon: int = 1,
         min_wacc_terminal_spread: float = 0.03,
 ) -> pd.Series:
     key = ValuationKey(ticker=ticker, valuation_year=valuation_year)
@@ -238,18 +260,17 @@ def dcf_valuation(
     if proxy.empty:
         return pd.Series(dtype="float64")
 
-    fcff_0 = pd.to_numeric(proxy.get("fcff"), errors="coerce")
-    net_debt = pd.to_numeric(proxy.get("net_debt_5"), errors="coerce")
-    shares = pd.to_numeric(proxy.get("shares_5"), errors="coerce")
-    price_5 = pd.to_numeric(proxy.get("price_5"), errors="coerce")
-    real_price_change = pd.to_numeric(proxy.get("real_price_change"), errors="coerce")
+    fcff_0                   = pd.to_numeric(proxy.get("fcff"),                errors="coerce")
+    net_debt                 = pd.to_numeric(proxy.get("net_debt_5"),           errors="coerce")
+    shares                   = pd.to_numeric(proxy.get("shares_5"),             errors="coerce")
+    price_5                  = pd.to_numeric(proxy.get("price_5"),              errors="coerce")
+    real_price_change        = pd.to_numeric(proxy.get("real_price_change"),    errors="coerce")
     real_market_price_change = pd.to_numeric(proxy.get("real_market_price_change"), errors="coerce")
 
     if pd.isna(fcff_0) or not np.isfinite(fcff_0):
         return pd.Series(dtype="float64")
 
     wacc = float(wacc_proxy(key.ticker, key.valuation_year))
-
     if not np.isfinite(wacc):
         return pd.Series(dtype="float64")
 
@@ -257,16 +278,16 @@ def dcf_valuation(
     if not np.isfinite(spread) or spread <= min_wacc_terminal_spread:
         return pd.Series(dtype="float64")
 
-    t = np.arange(1, forecast_years + 1, dtype=float)
-    fcff_forecast = fcff_0 * ((1 + growth_rate) ** t)
-    pv_fcff = fcff_forecast / ((1 + wacc) ** t)
+    t              = np.arange(1, forecast_years + 1, dtype=float)
+    fcff_forecast  = fcff_0 * ((1 + growth_rate) ** t)
+    pv_fcff        = fcff_forecast / ((1 + wacc) ** t)
 
     fcff_terminal_base = fcff_forecast[-1]
-    terminal_value = (fcff_terminal_base * (1 + terminal_growth_rate)) / spread
-    pv_terminal_value = terminal_value / ((1 + wacc) ** forecast_years)
+    terminal_value     = (fcff_terminal_base * (1 + terminal_growth_rate)) / spread
+    pv_terminal_value  = terminal_value / ((1 + wacc) ** forecast_years)
 
     enterprise_value = float(np.sum(pv_fcff) + pv_terminal_value)
-    equity_value = enterprise_value - net_debt if pd.notna(net_debt) else np.nan
+    equity_value     = enterprise_value - net_debt if pd.notna(net_debt) else np.nan
 
     value_per_share = np.nan
     if pd.notna(shares) and np.isfinite(shares) and shares != 0:
@@ -276,25 +297,23 @@ def dcf_valuation(
     if pd.notna(price_5) and np.isfinite(price_5) and price_5 != 0 and pd.notna(value_per_share):
         implied_upside_vs_price_5 = (value_per_share / price_5) - 1
 
-    result = {
-        "ticker": key.ticker,
-        "valuation_year": key.valuation_year,
-        "alpha_horizon": alpha_horizon,
-        "wacc": wacc,
-        "growth_rate": growth_rate,
+    return pd.Series({
+        "ticker":               key.ticker,
+        "valuation_year":       key.valuation_year,
+        "alpha_horizon":        alpha_horizon,
+        "wacc":                 wacc,
+        "growth_rate":          growth_rate,
         "terminal_growth_rate": terminal_growth_rate,
-        "terminal_value": float(terminal_value),
-        "pv_terminal_value": float(pv_terminal_value),
-        "enterprise_value": enterprise_value,
-        "net_debt": net_debt,
-        "equity_value": equity_value,
-        "value_per_share": value_per_share,
-        "real_upside": real_price_change,
-        "market_upside": real_market_price_change,
-        "implied_upside": implied_upside_vs_price_5
-    }
-
-    return pd.Series(result)
+        "terminal_value":       float(terminal_value),
+        "pv_terminal_value":    float(pv_terminal_value),
+        "enterprise_value":     enterprise_value,
+        "net_debt":             net_debt,
+        "equity_value":         equity_value,
+        "value_per_share":      value_per_share,
+        "real_upside":          real_price_change,
+        "market_upside":        real_market_price_change,
+        "implied_upside":       implied_upside_vs_price_5,
+    })
 
 
 def target_row(
@@ -304,11 +323,13 @@ def target_row(
         growth_rate: float = 0.0275,
         terminal_growth_rate: float = 0.01375,
         shift: int = 5,
-        alpha_horizon: int = 3,
+        alpha_horizon: int = 1,
+        alpha_clip: float = 2.0,
 ) -> pd.Series:
     """
     Input: ticker and valuation year
     Output: one-row target observation for dataset construction
+    alpha_clip=2.0 caps one-year excess returns at ±200% to suppress outliers
     """
     val = dcf_valuation(
         ticker=ticker,
@@ -324,15 +345,13 @@ def target_row(
         return pd.Series(dtype="float64")
 
     implied_upside = pd.to_numeric(val.get("implied_upside"), errors="coerce")
-    real_upside = pd.to_numeric(val.get("real_upside"), errors="coerce")
-    market_upside = pd.to_numeric(val.get("market_upside"), errors="coerce")
+    real_upside    = pd.to_numeric(val.get("real_upside"),    errors="coerce")
+    market_upside  = pd.to_numeric(val.get("market_upside"),  errors="coerce")
 
     if pd.isna(implied_upside) or not np.isfinite(implied_upside):
         return pd.Series(dtype="float64")
-
     if pd.isna(real_upside) or not np.isfinite(real_upside):
         return pd.Series(dtype="float64")
-
     if pd.isna(market_upside) or not np.isfinite(market_upside):
         return pd.Series(dtype="float64")
 
@@ -340,23 +359,28 @@ def target_row(
 
     if pd.isna(real_alpha) or not np.isfinite(real_alpha):
         return pd.Series(dtype="float64")
+    if abs(real_alpha) > alpha_clip:
+        return pd.Series(dtype="float64")
 
     return pd.Series({
-        "ticker": ticker,
+        "ticker":         ticker,
         "valuation_year": int(valuation_year),
-        "alpha_horizon": int(alpha_horizon),
-        "real_alpha": float(real_alpha),
+        "alpha_horizon":  int(alpha_horizon),
+        "real_alpha":     float(real_alpha),
         "implied_upside": float(implied_upside),
     })
 
+#ML Label is copula-based upon Bayesian P(real_alpha | DCF_signal)
+#Copula is fitted exclusively on high-rate regime (T_Bond >= 3.0%)
+#where DCF signal has demonstrated meaningful predictive power (tau = 0.172)
 
-# ML Label is copula-based upon Bayesian P(real_alpha | DCF_signal, T_Bond_Rate)
-# C-vine Copula based Labelling
+RATE_THRESHOLD = 0.030 #Threshold of T-Bonds to stratificate market regimes
 
 def clean_copula_dataset(df: pd.DataFrame) -> pd.DataFrame:
     """
     Input: a DataFrame after load_train_jsons
-    Output: a filtered DataFrame, without Nans & infinities
+    Output: filtered DataFrame restricted to high-rate regime (T_Bond >= RATE_THRESHOLD),
+    without NaNs and infinities
     """
     out = df.copy()
 
@@ -364,10 +388,11 @@ def clean_copula_dataset(df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(subset=["implied_upside", "real_alpha", "t_bond_rate"])
 
     out["implied_upside"] = pd.to_numeric(out["implied_upside"], errors="coerce")
-    out["real_alpha"] = pd.to_numeric(out["real_alpha"], errors="coerce")
-    out["t_bond_rate"] = pd.to_numeric(out["t_bond_rate"], errors="coerce")
+    out["real_alpha"]     = pd.to_numeric(out["real_alpha"],     errors="coerce")
+    out["t_bond_rate"]    = pd.to_numeric(out["t_bond_rate"],    errors="coerce")
 
     out = out.dropna(subset=["implied_upside", "real_alpha", "t_bond_rate"])
+    out = out[out["t_bond_rate"] >= RATE_THRESHOLD]
     out = out.drop_duplicates(subset=["ticker", "valuation_year"])
 
     return out.reset_index(drop=True)
@@ -376,17 +401,17 @@ def clean_copula_dataset(df: pd.DataFrame) -> pd.DataFrame:
 def marginal_diagnostics(x: pd.Series) -> dict:
     arr = np.asarray(x, dtype=float)
     return {
-        "n": len(arr),
-        "mean": float(np.mean(arr)),
-        "std": float(np.std(arr, ddof=1)),
-        "min": float(np.min(arr)),
-        "q01": float(np.quantile(arr, 0.01)),
-        "q05": float(np.quantile(arr, 0.05)),
-        "median": float(np.median(arr)),
-        "q95": float(np.quantile(arr, 0.95)),
-        "q99": float(np.quantile(arr, 0.99)),
-        "max": float(np.max(arr)),
-        "skew": float(stats.skew(arr, bias=False)),
+        "n":               len(arr),
+        "mean":            float(np.mean(arr)),
+        "std":             float(np.std(arr, ddof=1)),
+        "min":             float(np.min(arr)),
+        "q01":             float(np.quantile(arr, 0.01)),
+        "q05":             float(np.quantile(arr, 0.05)),
+        "median":          float(np.median(arr)),
+        "q95":             float(np.quantile(arr, 0.95)),
+        "q99":             float(np.quantile(arr, 0.99)),
+        "max":             float(np.max(arr)),
+        "skew":            float(stats.skew(arr, bias=False)),
         "kurtosis_excess": float(stats.kurtosis(arr, fisher=True, bias=False)),
     }
 
@@ -394,10 +419,9 @@ def marginal_diagnostics(x: pd.Series) -> dict:
 def prepare_copula_dataset(train_dir: str = "Datasets/train/") -> pd.DataFrame:
     """
     Input: directory of the train Dataset
-    Output: clean DataFrame with empirical pseudo-observations for C-vine copula modeling
-    C-vine root node is T_Bond_Rate (w_R) — strongest conditioning variable.
-    Pair 1: Clayton(u_A, v_D)         — alpha vs DCF (unconditional)
-    Pair 2: Clayton(u_A | w_R, v_D | w_R) — alpha vs DCF conditional on T_Bond
+    Output: clean DataFrame with empirical pseudo-observations for Clayton copula modeling
+    restricted to high-rate regime (T_Bond >= 3.0%) where DCF signal is predictive
+    One-year alpha horizon (alpha_horizon=1)
     """
     df = load_train_jsons(train_dir)
     df = clean_copula_dataset(df)
@@ -406,28 +430,25 @@ def prepare_copula_dataset(train_dir: str = "Datasets/train/") -> pd.DataFrame:
         raise ValueError("Dataset is empty after cleaning.")
 
     out = df.copy()
-    n = len(out)
+    n   = len(out)
 
-    a = np.asarray(out["real_alpha"], dtype=float)
+    a = np.asarray(out["real_alpha"],     dtype=float)
     d = np.asarray(out["implied_upside"], dtype=float)
-    r = np.asarray(out["t_bond_rate"], dtype=float)
 
     out["u_A"] = stats.rankdata(a, method="average") / (n + 1.0)
     out["v_D"] = stats.rankdata(d, method="average") / (n + 1.0)
-    out["w_R"] = stats.rankdata(r, method="average") / (n + 1.0)
 
     return out
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=1)
 def _cached_copula_arrays(train_dir: str = "Datasets/train/"):
     df = prepare_copula_dataset(train_dir=train_dir)
 
     alpha_sample = np.sort(df["real_alpha"].dropna().to_numpy(dtype=float))
-    dcf_sample = np.sort(df["implied_upside"].dropna().to_numpy(dtype=float))
-    tbond_sample = np.sort(df["t_bond_rate"].dropna().to_numpy(dtype=float))
+    dcf_sample   = np.sort(df["implied_upside"].dropna().to_numpy(dtype=float))
 
-    return alpha_sample, dcf_sample, tbond_sample
+    return alpha_sample, dcf_sample
 
 
 def _copula_uv(df: pd.DataFrame, u_col: str = "u_A", v_col: str = "v_D", eps: float = 1e-12):
@@ -462,7 +483,7 @@ def clayton_log_density(u: np.ndarray, v: np.ndarray, theta: float) -> np.ndarra
 
     Clayton copula was chosen because it produced the best fit among tested families.
     In the model comparison it had the strongest information criteria:
-    loglik = 18.8832, AIC = -35.7664, BIC = -30.9174, tau = 0.1063(the biggest out of others)
+    loglik = 18.8832, AIC = -35.7664, BIC = -30.9174, tau = 0.1507
     which were better than Student-t, Gaussian, Gumbel, and Frank alternatives.
     """
     if not np.isfinite(theta) or theta <= 0.0:
@@ -486,9 +507,9 @@ def clayton_log_density(u: np.ndarray, v: np.ndarray, theta: float) -> np.ndarra
         return np.full_like(u, -np.inf, dtype=float)
 
     logc = (
-            np.log1p(theta)
-            + (-theta - 1.0) * (log_u + log_v)
-            + (-2.0 - 1.0 / theta) * np.log(s)
+        np.log1p(theta)
+        + (-theta - 1.0) * (log_u + log_v)
+        + (-2.0 - 1.0 / theta) * np.log(s)
     )
 
     logc = np.where(np.isfinite(logc), logc, -np.inf)
@@ -509,8 +530,7 @@ def clayton_copula_loglik(u: np.ndarray, v: np.ndarray, theta: float) -> float:
 def _clayton_h_function(v: np.ndarray, u: np.ndarray, theta: float, eps: float = 1e-12) -> np.ndarray:
     """
     Input: pseudo-observations v (conditioning) and u (conditioned), Clayton theta
-    Output: h(u|v) = partial C(u,v) / partial v — conditional CDF of u given v
-    Used in C-vine to compute conditional pseudo-observations for the second pair copula.
+    Output: h(u|v) = partial C(u,v) / partial v - conditional CDF of u given v
     """
     v = np.clip(v, eps, 1.0 - eps)
     u = np.clip(u, eps, 1.0 - eps)
@@ -533,70 +553,58 @@ def _clayton_h_function(v: np.ndarray, u: np.ndarray, theta: float, eps: float =
     h = (pv / v) * np.power(s, -1.0 / theta - 1.0)
     return np.clip(h, eps, 1.0 - eps)
 
-RATE_THRESHOLD = 0.030 #Threshold of T-Bonds to stratificate market regimes of High price of debt/Low price of debt
 
-def clayton_CMLE(
-        train_dir: str = "Datasets/train/",
-        rate_threshold: float = RATE_THRESHOLD,
-) -> dict:
+def clayton_CMLE(train_dir: str = "Datasets/train/") -> dict:
     """
-    Input: prepared copula DataFrame with empirical pseudo-observations
-    Output: fitted Clayton copula parameters for two rate regimes
+    Input: train directory
+    Output: fitted Clayton copula on high-rate regime observations (T_Bond >= 3.0%)
+    One-year alpha horizon
     """
     df = prepare_copula_dataset(train_dir=train_dir)
+    u, v = _copula_uv(df, "u_A", "v_D")
 
-    def _fit(subset: pd.DataFrame, label: str) -> dict:
-        u, v = _copula_uv(subset, "u_A", "v_D")
+    tau = stats.kendalltau(u, v, nan_policy="omit").statistic
+    if tau is None or not np.isfinite(tau):
+        theta0 = 1.0
+    else:
+        tau    = float(np.clip(tau, 1e-4, 0.95))
+        theta0 = max(2.0 * tau / (1.0 - tau), 1e-3)
 
-        tau = stats.kendalltau(u, v, nan_policy="omit").statistic
-        if tau is None or not np.isfinite(tau):
-            theta0 = 1.0
-        else:
-            tau = float(np.clip(tau, 1e-4, 0.95))
-            theta0 = max(2.0 * tau / (1.0 - tau), 1e-3)
+    log_u   = np.log(np.clip(u, 1e-300, None))
+    log_v   = np.log(np.clip(v, 1e-300, None))
+    min_log = min(float(np.min(log_u)), float(np.min(log_v)))
+    theta_max = min(700.0 / abs(min_log), 50.0) if min_log < 0 else 50.0
 
-        log_u = np.log(np.clip(u, 1e-300, None))
-        log_v = np.log(np.clip(v, 1e-300, None))
-        min_log = min(float(np.min(log_u)), float(np.min(log_v)))
-        theta_max = min(700.0 / abs(min_log), 50.0) if min_log < 0 else 50.0
+    def objective(x):
+        ll = clayton_copula_loglik(u, v, float(x[0]))
+        return np.inf if not np.isfinite(ll) else -ll
 
-        def objective(x):
-            ll = clayton_copula_loglik(u, v, float(x[0]))
-            return np.inf if not np.isfinite(ll) else -ll
+    res = optimize.minimize(
+        objective,
+        x0=np.array([theta0], dtype=float),
+        method="L-BFGS-B",
+        bounds=[(1e-6, theta_max)],
+        options={"ftol": 1e-12, "gtol": 1e-8, "maxiter": 1000},
+    )
 
-        res = optimize.minimize(
-            objective,
-            x0=np.array([theta0], dtype=float),
-            method="L-BFGS-B",
-            bounds=[(1e-6, theta_max)],
-            options={"ftol": 1e-12, "gtol": 1e-8, "maxiter": 1000},
-        )
-
-        theta_hat = float(res.x[0])
-        loglik = clayton_copula_loglik(u, v, theta_hat)
-        n = len(u)
-        k = 1
-        tau_hat = theta_hat / (theta_hat + 2.0)
-
-        return {
-            "regime": label,
-            "n": int(n),
-            "k": int(k),
-            "theta": float(theta_hat),
-            "kendall_tau_implied": float(tau_hat),
-            "loglik": float(loglik),
-            "aic": float(2 * k - 2 * loglik),
-            "bic": float(np.log(n) * k - 2 * loglik),
-            "success": bool(res.success),
-        }
-
-    low  = df[df["t_bond_rate"] <  rate_threshold]
-    high = df[df["t_bond_rate"] >= rate_threshold]
+    theta_hat = float(res.x[0])
+    loglik    = clayton_copula_loglik(u, v, theta_hat)
+    n         = len(u)
+    k         = 1
+    tau_hat   = theta_hat / (theta_hat + 2.0)
 
     return {
-        "rate_threshold": rate_threshold,
-        "low_rate":  _fit(low,  "low_rate"),
-        "high_rate": _fit(high, "high_rate"),
+        "family":              "clayton",
+        "regime":              "high_rate",
+        "rate_threshold":      RATE_THRESHOLD,
+        "success":             bool(res.success),
+        "n":                   int(n),
+        "k":                   int(k),
+        "theta":               float(theta_hat),
+        "kendall_tau_implied": float(tau_hat),
+        "loglik":              float(loglik),
+        "aic":                 float(2 * k - 2 * loglik),
+        "bic":                 float(np.log(n) * k - 2 * loglik),
     }
 
 
@@ -605,60 +613,37 @@ def _cached_clayton_params(train_dir: str = "Datasets/train/") -> dict:
     return clayton_CMLE(train_dir=train_dir)
 
 
-@lru_cache(maxsize=4)
-def _cached_copula_arrays(train_dir: str = "Datasets/train/"):
-    df = prepare_copula_dataset(train_dir=train_dir)
-
-    def _arrays(subset: pd.DataFrame):
-        alpha_sample = np.sort(subset["real_alpha"].dropna().to_numpy(dtype=float))
-        dcf_sample   = np.sort(subset["implied_upside"].dropna().to_numpy(dtype=float))
-        return alpha_sample, dcf_sample
-
-    low  = df[df["t_bond_rate"] <  RATE_THRESHOLD]
-    high = df[df["t_bond_rate"] >= RATE_THRESHOLD]
-
-    return {
-        "low_rate":  _arrays(low),
-        "high_rate": _arrays(high),
-    }
-
-
 def label_maker(
         dcf_signal: float,
-        t_bond_signal: float,
         grid_size: int = 1000,
         eps: float = 1e-6,
 ) -> pd.Series:
     """
-    Input: DCF signal, T_Bond_Rate at valuation date
-    Output: pandas.Series with P(alpha > 0 | DCF, regime), E(alpha | DCF, regime)
-    Regime is determined by t_bond_signal vs RATE_THRESHOLD.
+    Input: DCF signal (implied_upside)
+    Output: pandas.Series with P(alpha > 0 | DCF), E(alpha | DCF)
+    Copula fitted on high-rate regime, one-year alpha horizon
+    Apply only when T_Bond >= 3.0%
     """
     train_dir = "Datasets/train/"
 
     if pd.isna(dcf_signal) or not np.isfinite(dcf_signal):
         return pd.Series(dtype="float64")
-    if pd.isna(t_bond_signal) or not np.isfinite(t_bond_signal):
-        return pd.Series(dtype="float64")
 
-    regime = "high_rate" if t_bond_signal >= RATE_THRESHOLD else "low_rate"
-
-    params  = _cached_clayton_params(train_dir=train_dir)
-    theta   = params[regime]["theta"]
-    arrays  = _cached_copula_arrays(train_dir=train_dir)
-    alpha_sample, dcf_sample = arrays[regime]
+    params                    = _cached_clayton_params(train_dir=train_dir)
+    theta                     = params["theta"]
+    alpha_sample, dcf_sample  = _cached_copula_arrays(train_dir=train_dir)
 
     if len(alpha_sample) == 0 or len(dcf_sample) == 0:
         return pd.Series(dtype="float64")
 
-    v = np.searchsorted(dcf_sample, dcf_signal, side="right") / (len(dcf_sample) + 1.0)
-    v = float(np.clip(v, eps, 1 - eps))
+    v  = np.searchsorted(dcf_sample,   dcf_signal, side="right") / (len(dcf_sample)   + 1.0)
+    v  = float(np.clip(v, eps, 1 - eps))
 
-    u0 = np.searchsorted(alpha_sample, 0.0, side="right") / (len(alpha_sample) + 1.0)
+    u0 = np.searchsorted(alpha_sample, 0.0,        side="right") / (len(alpha_sample)  + 1.0)
     u0 = float(np.clip(u0, eps, 1 - eps))
 
-    s0 = (u0 ** (-theta) + v ** (-theta) - 1.0)
-    h0 = (v ** (-theta - 1.0)) * (s0 ** (-1.0 / theta - 1.0))
+    s0           = (u0 ** (-theta) + v ** (-theta) - 1.0)
+    h0           = (v ** (-theta - 1.0)) * (s0 ** (-1.0 / theta - 1.0))
     p_alpha_gt_0 = float(np.clip(1.0 - h0, 0.0, 1.0))
 
     u_grid = np.linspace(eps, 1 - eps, grid_size)
@@ -666,8 +651,8 @@ def label_maker(
     probs      = np.arange(1, len(alpha_sample) + 1) / (len(alpha_sample) + 1.0)
     alpha_grid = np.interp(u_grid, probs, alpha_sample)
 
-    log_u = np.log(np.clip(u_grid, 1e-300, None))
-    log_v_scalar = np.log(max(v, 1e-300))
+    log_u           = np.log(np.clip(u_grid, 1e-300, None))
+    log_v_scalar    = np.log(max(v, 1e-300))
     neg_theta_log_u = -theta * log_u
     neg_theta_log_v = -theta * log_v_scalar
 
@@ -693,25 +678,27 @@ def label_maker(
     if not np.isfinite(mass) or mass <= 0:
         return pd.Series(dtype="float64")
 
-    density /= mass
+    density       /= mass
     expected_alpha = float(np.trapezoid(alpha_grid * density, u_grid))
 
     return pd.Series({
         "P(alpha > 0)": p_alpha_gt_0,
         "E(alpha)":     expected_alpha,
-        "regime":       regime,
     })
 
 
-# Notes
+#Notes
 '''
-When |Dcf| falls within the [0.38 – 1.22] range, the probability of the implied share price
+When |Dcf| falls within the [0.38 - 1.22] range, the probability of the implied share price
 and alpha sharing the same sign is >60%, peaking at 70.6%. This confirms that the correlation
 between magnitude and sign convergence is strongest at conventional DCF values. Conversely,
-accuracy drops to 49% for |Dcf| in [0.21–0.38] and settles into a purely random or inverse
-distribution-45% at extremes (|Dcf|>4.49)
-Though < 0.38 range can be also applicable due to real_upside-market_upside being negative,
-while both signs of implied and real upsides match
+accuracy drops to 49% for |Dcf| in [0.21-0.38] and settles into a purely random or inverse
+distribution - 45% at extremes (|Dcf| > 4.49).
+Though the < 0.38 range can also be applicable due to real_upside - market_upside being
+negative while both signs of implied and real upsides match.
 
-Result: we will only use (0 – 1.22] range for copula construction
+Result: only the (0 - 1.22] range is used for copula construction.
+Note: the copula is trained exclusively on high-rate observations (T_Bond >= 3.0%) where
+Kendall tau between implied_upside and real_alpha is 0.172 vs 0.057 in the low-rate regime.
+Alpha horizon is one year. Alpha is capped at +-200% to suppress outliers.
 '''
