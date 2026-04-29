@@ -1,6 +1,6 @@
 from pathlib import Path
 from dataclasses import dataclass
-from dataset_processor import *
+from modules_processor import *
 import numpy as np
 import pandas as pd
 
@@ -202,38 +202,6 @@ def wacc_proxy(ticker: str, valuation_year: int) -> float:
     cost_of_debt        = risk_free + credit_spread
 
     return (equity_in_structure * cost_of_capital) + (debt_in_structure * cost_of_debt * tax_shield)
-
-
-def get_market_3y_return(ticker: str, valuation_year: int) -> float | None:
-    """
-    Input: Ticker and Valuation year
-    Output: 3Y CAGR of S&P 500 prior to valuation date
-    """
-    try:
-        df = time_slicing(ticker, valuation_year - 4, valuation_year)
-        if df is None or df.empty or "market_price" not in df.columns:
-            return None
-
-        df = df[["market_price"]].dropna().sort_index()
-        if len(df) < 2:
-            return None
-
-        price_end   = df["market_price"].iloc[-1]
-        price_start = df["market_price"].iloc[0]
-
-        if price_start <= 0 or not np.isfinite(price_start):
-            return None
-
-        years = (df.index[-1] - df.index[0]).days / 365.25
-        if years < 1.0:
-            return None
-
-        cagr = (price_end / price_start) ** (3.0 / years) - 1.0
-        return float(cagr) if np.isfinite(cagr) else None
-
-    except Exception:
-        return None
-
 
 def dcf_valuation(
         ticker: str,

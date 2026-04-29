@@ -1,7 +1,7 @@
 import pandas as pd
+import numpy as np
 import os
 import json
-
 
 def _load_ticker_df(ticker: str) -> pd.DataFrame:
     return pd.read_parquet(f"Datasets/tickers/{ticker}/timeseries.parquet")
@@ -132,6 +132,63 @@ def year_slicing(ticker: str, start_year: int, end_year: int, shift: int = 5) ->
 
     return pd.DataFrame(rows)
 
+
+def get_market_3y_return(ticker: str, valuation_year: int) -> float | None:
+    """
+    Input: Ticker and Valuation year
+    Output: 3Y CAGR of S&P 500 prior to valuation date
+    """
+    try:
+        df = time_slicing(ticker, valuation_year - 4, valuation_year)
+        if df is None or df.empty or "market_price" not in df.columns:
+            return None
+
+        df = df[["market_price"]].dropna().sort_index()
+        if len(df) < 2:
+            return None
+
+        price_end   = df["market_price"].iloc[-1]
+        price_start = df["market_price"].iloc[0]
+
+        if price_start <= 0 or not np.isfinite(price_start):
+            return None
+
+        years = (df.index[-1] - df.index[0]).days / 365.25
+        if years < 1.0:
+            return None
+
+        cagr = (price_end / price_start) ** (3.0 / years) - 1.0
+        return float(cagr) if np.isfinite(cagr) else None
+
+    except Exception:
+        return None
+
+#Was kinda lazy to edit this function for main module so here is the copy
+def get_market_3y_return_from_df(df: pd.DataFrame) -> float | None:
+    """
+    Input: parsed DataFrame with market_price
+    Output: 3Y S&P 500 return from already parsed data
+    """
+
+    if df is None or df.empty or "market_price" not in df.columns:
+        return None
+
+    data = df[["market_price"]].dropna().sort_index()
+
+    if len(data) < 2:
+        return None
+
+    price_start = data["market_price"].iloc[0]
+    price_end = data["market_price"].iloc[-1]
+
+    if price_start <= 0 or not np.isfinite(price_start):
+        return None
+
+    result = price_end / price_start - 1
+
+    return float(result) if np.isfinite(result) else None
+
+
 #train dataset
 
 def load_train_jsons(train_dir: str = "Datasets/train/") -> pd.DataFrame:
@@ -162,3 +219,75 @@ def load_train_jsons(train_dir: str = "Datasets/train/") -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     return df
+
+#main
+
+def live_market_features(
+        ticker: str,
+        t_bond_rate: float,
+        benchmark: str = "^GSPC",
+) -> pd.Series:
+    """
+    Input: ticker and current T-Bond rate
+    Output: one live inference row with market ML features for a year's worth
+    """
+
+    from parser import (
+        get_price,
+        load_market_returns,
+        compute_returns,
+        compute_beta,
+        compute_volatility,
+        compute_log_volume,
+        compute_market_regime_features,
+    )
+
+    ticker = str(ticker).upper().strip()
+
+    today = pd.Timestamp.today().normalize()
+    end = today + pd.Timedelta(days=1)
+
+    one_year_ago = today - pd.DateOffset(years=1)
+    three_years_ago = today - pd.DateOffset(years=3)
+
+    start_str = three_years_ago.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+
+    market_df = load_market_returns(start=start_str, end=end_str, benchmark=benchmark)
+    df = get_price(ticker=ticker, start=start_str, end=end_str)
+
+    if df is None or df.empty:
+        return pd.Series(dtype="float64")
+
+    df = df.join(market_df, how="left")
+
+    df = compute_returns(df)
+    df = compute_beta(df)
+    df = compute_volatility(df)
+    df = compute_log_volume(df)
+    df = compute_market_regime_features(df)
+
+    window_1y = df.loc[(df.index >= one_year_ago) & (df.index <= today)].copy()
+
+    if window_1y.empty:
+        return pd.Series(dtype="float64")
+
+    beta = pd.to_numeric(window_1y["beta_ewm"], errors="coerce")
+    volatility = pd.to_numeric(window_1y["volatility_21d"], errors="coerce")
+    log_volume = pd.to_numeric(window_1y["log_volume"], errors="coerce")
+    market_deviation = pd.to_numeric(window_1y["market_deviation"], errors="coerce")
+    market_momentum = pd.to_numeric(window_1y["market_momentum"], errors="coerce")
+
+    return pd.Series({
+        "ticker": ticker,
+        "t_bond_rate": float(t_bond_rate),
+        "beta_ewm_median": float(beta.median()),
+        "volatility_21d_mean": float(volatility.mean()),
+        "volatility_21d_max": float(volatility.max()),
+        "log_volume_mean": float(log_volume.mean()),
+        "market_deviation_mean": float(market_deviation.mean()),
+        "market_deviation_std": float(market_deviation.std()),
+        "market_momentum_mean": float(market_momentum.mean()),
+        "market_momentum_std": float(market_momentum.std()),
+        "market_3y_return": get_market_3y_return_from_df(df),
+    })

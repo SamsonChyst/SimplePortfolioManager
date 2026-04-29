@@ -186,20 +186,35 @@ def fit_copula_model(df: pd.DataFrame, path: Path = COPULA_CFG_PATH) -> dict:
 
 #Usage
 
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, qs: list[float]) -> np.ndarray:
+    sorter = np.argsort(values)
+    values = values[sorter]
+    weights = weights[sorter]
+
+    cdf = np.cumsum(weights)
+    cdf /= cdf[-1]
+
+    return np.interp(qs, cdf, values)
+
+
 def copula_predict(
-    alpha_hat: float,
-    implied_upside: float,
-    path: Path = COPULA_CFG_PATH,
-    grid_size: int = 500,
-) -> tuple[float, float]:
+        alpha_hat: float,
+        implied_upside: float,
+        path: Path = COPULA_CFG_PATH,
+        grid_size: int = 500,
+        thresholds: list[float] | None = None,
+) -> pd.Series:
     """
     Input: raw alpha_hat, implied_upside
-    Output: (P(alpha > 0), E[alpha])
+    Output: conditional alpha distribution metrics
     """
     params = load_copula_config(path)
 
     if _alpha_sorted is None or _ah_values is None or _iu_values is None:
         raise RuntimeError("Run fit_copula_model(df) or fit_marginals(df) before prediction.")
+
+    if thresholds is None:
+        thresholds = [0.0, -0.10, -0.20, 0.10, 0.20]
 
     u_ah_obs = ecdf(alpha_hat, _ah_values)
     u_iu_obs = ecdf(implied_upside, _iu_values)
@@ -216,46 +231,100 @@ def copula_predict(
     lp += _clayton_logpdf_vec(w, v_iu, theta_ra_iu)
 
     lp -= np.max(lp)
-
     density = np.exp(lp)
+
     area = np.trapezoid(density, w)
 
     if not np.isfinite(area) or area <= 0:
-        return np.nan, np.nan
+        return pd.Series(dtype=float)
 
     density /= area
 
     alpha_vals = inv_ecdf(w)
 
-    prob = float(np.trapezoid(density * (alpha_vals > 0).astype(float), w))
-    exp = float(np.trapezoid(density * alpha_vals, w))
+    expected_alpha = float(np.trapezoid(density * alpha_vals, w))
+    expected_alpha_sq = float(np.trapezoid(density * alpha_vals ** 2, w))
+    alpha_std = float(np.sqrt(max(expected_alpha_sq - expected_alpha ** 2, 0.0)))
 
-    return prob, exp
+    q05, q25, q50, q75, q95 = _weighted_quantile(
+        alpha_vals,
+        density,
+        [0.05, 0.25, 0.50, 0.75, 0.95],
+    )
+
+    prob_positive = float(np.trapezoid(density * (alpha_vals > 0).astype(float), w))
+    prob_negative = float(np.trapezoid(density * (alpha_vals < 0).astype(float), w))
+
+    positive_mask = alpha_vals > 0
+    negative_mask = alpha_vals < 0
+
+    positive_area = np.trapezoid(density * positive_mask.astype(float), w)
+    negative_area = np.trapezoid(density * negative_mask.astype(float), w)
+
+    expected_upside = (
+        float(np.trapezoid(density * alpha_vals * positive_mask.astype(float), w) / positive_area)
+        if positive_area > 0 else np.nan
+    )
+
+    expected_downside = (
+        float(np.trapezoid(density * alpha_vals * negative_mask.astype(float), w) / negative_area)
+        if negative_area > 0 else np.nan
+    )
+
+    alpha_sharpe_like = expected_alpha / alpha_std if alpha_std > 0 else np.nan
+
+    result = {
+        "prob_positive": prob_positive,
+        "prob_negative": prob_negative,
+        "expected_alpha": expected_alpha,
+        "median_alpha": float(q50),
+        "alpha_std": alpha_std,
+        "alpha_q05": float(q05),
+        "alpha_q25": float(q25),
+        "alpha_q50": float(q50),
+        "alpha_q75": float(q75),
+        "alpha_q95": float(q95),
+        "expected_upside": expected_upside,
+        "expected_downside": expected_downside,
+        "alpha_sharpe_like": float(alpha_sharpe_like),
+        "implied_upside_percentile": u_iu_obs,
+        "alpha_hat_percentile": u_ah_obs,
+    }
+
+    for threshold in thresholds:
+        key = str(threshold).replace("-", "minus_").replace(".", "_")
+        result[f"prob_alpha_gt_{key}"] = float(
+            np.trapezoid(density * (alpha_vals > threshold).astype(float), w)
+        )
+        result[f"prob_alpha_lt_{key}"] = float(
+            np.trapezoid(density * (alpha_vals < threshold).astype(float), w)
+        )
+
+    return pd.Series(result)
 
 
 def copula_predict_batch(
-    df_test: pd.DataFrame,
-    path: Path = COPULA_CFG_PATH,
-    grid_size: int = 500,
+        df_test: pd.DataFrame,
+        path: Path = COPULA_CFG_PATH,
+        grid_size: int = 500,
+        thresholds: list[float] | None = None,
 ) -> pd.DataFrame:
     """
     Input: test DataFrame with alpha_hat, implied_upside
-    Output: DataFrame with prob_positive and expected_alpha columns
+    Output: DataFrame with conditional alpha distribution metrics
     """
     results = []
 
     for _, row in df_test.iterrows():
-        prob, exp = copula_predict(
+        pred = copula_predict(
             alpha_hat=row["alpha_hat"],
             implied_upside=row["implied_upside"],
             path=path,
             grid_size=grid_size,
+            thresholds=thresholds,
         )
 
-        results.append({
-            "prob_positive": prob,
-            "expected_alpha": exp,
-        })
+        results.append(pred)
 
     return pd.DataFrame(results)
 
@@ -270,3 +339,51 @@ if __name__ == "__main__":
     df = pd.read_csv("Datasets/train_dataset_full.csv")
 
     params = fit_copula_model(df)
+
+
+#Notes
+"""
+Model intuition and empirical relationships
+
+The copula model is built to capture the conditional relationship between the DCF-derived signal 
+(implied_upside) and the realized market-relative performance (real_alpha). Empirically, this 
+relationship is weak but stable and monotonic in rank space rather than in levels.
+
+Across the dataset (train/test split around 2023), the dependence between signals and realized alpha 
+is positive but moderate:
+
+- Rank correlations (Spearman, Kendall) are consistently low-to-mid (~0.15–0.26),
+  indicating that the signal contains information but is far from deterministic.
+- Pearson correlations are slightly higher (~0.33–0.36), reflecting sensitivity to tail observations.
+- Sign accuracy (predicting alpha > 0) is relatively strong (~72%), suggesting that the model 
+  captures directional tendencies better than magnitude.
+
+The copula approach focuses on modeling this dependence structure in a non-linear and distribution-aware way.
+Compared to direct ML predictions:
+
+- The copula produces slightly lower rank correlations, but remains competitive.
+- It provides a full conditional distribution of alpha instead of a point estimate.
+- Calibration analysis shows that predicted probabilities of positive alpha increase monotonically 
+  with realized frequency, although the model tends to be mildly conservative (underestimates positive outcomes).
+
+Importantly, the distribution of realized alpha is heavy-tailed and asymmetric:
+
+- Extreme negative outcomes are more frequent than implied by a Gaussian assumption.
+- The conditional expected alpha is often negative in aggregate, reflecting a generally 
+  competitive or unfavorable market environment in the sample.
+- Upside scenarios exist but are driven by right-tail events rather than central tendency.
+
+Therefore, the model should be interpreted as:
+
+    A probabilistic mapping from DCF signal strength to the conditional distribution of alpha,
+    not as a precise point predictor.
+
+The key output of the model is not alpha itself, but:
+
+- Probability of outperformance (P(alpha > 0))
+- Conditional expectation (E[alpha | signal])
+- Distribution shape (quantiles, tails, asymmetry)
+
+These quantities are more stable and informative than direct alpha predictions, 
+especially under weak signal-to-noise conditions typical for equity markets.
+"""

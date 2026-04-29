@@ -1,39 +1,8 @@
 import json
 from pathlib import Path
 import pandas as pd
-from dataset_processor import has_fundamentals, time_slicing
-from valuation_marker import target_row, get_market_3y_return
-
-
-#Notes
-'''
-Dataset Construction Methodology - Base Alpha Dataset
-
-This module builds the base ticker-year dataset used before the machine learning and copula stages.
-Each observation represents one ticker at one valuation year and contains three groups of information:
-
-  1. Realized outcome:
-     real_alpha = one-year stock return minus one-year S&P 500 return.
-
-  2. Fundamental valuation signal:
-     implied_upside is produced by the DCF valuation module and is kept as an independent
-     fundamental signal. It is not transformed into old copula-based labels at this stage.
-
-  3. Market regime features:
-     aggregated market-based variables are computed from the one-year market window prior
-     to the valuation year using filing-date-aware time slicing.
-
-The dataset is restricted to the high-rate regime defined by:
-  T_Bond_Rate >= RATE_THRESHOLD
-
-This restriction is based on the empirical observation that the DCF signal has stronger
-relationship with realized alpha during high-rate periods. However, this module does not
-fit a copula and does not create probability labels. Its purpose is only to construct the
-clean base dataset used later by:
-
-  - market-only ML model: market features -> alpha_hat
-  - vine copula model: real_alpha, alpha_hat, implied_upside, t_bond_rate
-'''
+from modules_processor import has_fundamentals, time_slicing, get_market_3y_return
+from valuation_dcf import target_row
 
 #cfg
 RATE_THRESHOLD = 0.030 #Threshold of T-Bonds to stratificate market regimes
@@ -335,3 +304,34 @@ if __name__ == "__main__":
 
     build_json()
     build_dataset()
+
+
+#Notes
+'''
+Dataset Construction Methodology - Base Alpha Dataset
+
+This module builds the base ticker-year dataset used before the machine learning and copula stages.
+Each observation represents one ticker at one valuation year and contains three groups of information:
+
+  1. Realized outcome:
+     real_alpha = one-year stock return minus one-year S&P 500 return.
+
+  2. Fundamental valuation signal:
+     implied_upside is produced by the DCF valuation module and is kept as an independent
+     fundamental signal. It is not transformed into old copula-based labels at this stage.
+
+  3. Market regime features:
+     aggregated market-based variables are computed from the one-year market window prior
+     to the valuation year using filing-date-aware time slicing.
+
+The dataset is restricted to the high-rate regime defined by:
+  T_Bond_Rate >= RATE_THRESHOLD
+
+This restriction is based on the empirical observation that the DCF signal has stronger
+relationship with realized alpha during high-rate periods. However, this module does not
+fit a copula and does not create probability labels. Its purpose is only to construct the
+clean base dataset used later by:
+
+  - market-only ML model: market features -> alpha_hat
+  - vine copula model: real_alpha, alpha_hat, implied_upside
+'''
