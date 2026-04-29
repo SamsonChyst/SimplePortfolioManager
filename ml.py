@@ -1,24 +1,19 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import make_scorer, f1_score
-import xgboost as xgb
-import lightgbm as lgb
-from catboost import CatBoostClassifier
+import matplotlib.pyplot as plt
+import optuna
+from catboost import CatBoostRegressor
+from sklearn.model_selection import RepeatedKFold, StratifiedKFold, KFold, train_test_split
+from sklearn.metrics import mean_squared_error
+from scipy.stats import spearmanr, kendalltau
 
 
-FEATURES_DCF = [
-    "implied_upside",
-    "t_bond_rate",
-    "p_alpha_gt_0",
-    "e_alpha",
-]
+INPUT_PATH = "Datasets/train_dataset.csv"
+OUTPUT_PATH = "Datasets/train_dataset_full.csv"
 
-FEATURES_MARKET = [
+TARGET = "real_alpha"
+
+MARKET_FEATURES = [
     "beta_ewm_median",
     "volatility_21d_mean",
     "volatility_21d_max",
@@ -28,206 +23,341 @@ FEATURES_MARKET = [
     "market_momentum_mean",
     "market_momentum_std",
     "market_3y_return",
+    "t_bond_rate",
 ]
 
-FEATURES_FULL = FEATURES_DCF + FEATURES_MARKET
-TARGET = "alpha_intensity"
+#ML-based copula factor estimation (alpha hat)
 
-
-def load_data(path: str, features: list[str]) -> tuple:
+def load_market_dataset(path: str = INPUT_PATH) -> pd.DataFrame:
+    """
+    Input: path to train_dataset.csv
+    Output: cleaned DataFrame with market features and real_alpha
+    """
     df = pd.read_csv(path)
-    df = df.dropna(subset=features + [TARGET])
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=MARKET_FEATURES + [TARGET])
+    return df.reset_index(drop=True)
 
-    X = df[features].copy()
 
-    le = LabelEncoder()
-    y = pd.Series(
-        le.fit_transform(df[TARGET].astype(int)),
-        index=df.index,
-        name=TARGET,
+def build_market_model(
+        iterations: int = 300,
+        depth: int = 3,
+        learning_rate: float = 0.05,
+        l2_leaf_reg: float = 3.0,
+) -> CatBoostRegressor:
+    """
+    Input: none
+    Output: configured CatBoostRegressor for real_alpha prediction
+    """
+    return CatBoostRegressor(
+        iterations=iterations,
+        depth=depth,
+        learning_rate=learning_rate,
+        l2_leaf_reg=l2_leaf_reg,
+        loss_function="RMSE",
+        early_stopping_rounds=50,
+        random_seed=42,
+        verbose=0,
     )
 
-    print("Target mapping:")
-    for old, new in zip(le.classes_, range(len(le.classes_))):
-        print(f"  {old} -> {new}")
 
-    return X, y, df
+def check_fold_stability(df: pd.DataFrame, n_splits: int = 5) -> None:
+    """
+    Input: DataFrame with market features and real_alpha, number of CV folds
+    Output: printed per-fold target statistics to diagnose hidden dataset structure
+    """
+    X = df[MARKET_FEATURES]
+    y = df[TARGET]
 
-
-def make_models() -> dict:
-    return {
-        "LogisticRegression": Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", LogisticRegression(
-                max_iter=1000,
-                C=1.0,
-                random_state=42,
-            )),
-        ]),
-        "RandomForest": RandomForestClassifier(
-            n_estimators=300,
-            max_depth=4,
-            min_samples_leaf=10,
-            random_state=42,
-            n_jobs=-1,
-        ),
-        "GradientBoosting": GradientBoostingClassifier(
-            n_estimators=200,
-            max_depth=3,
-            learning_rate=0.05,
-            min_samples_leaf=10,
-            random_state=42,
-        ),
-        "XGBoost": xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=10,
-            random_state=42,
-            verbosity=0,
-            eval_metric="mlogloss",
-        ),
-        "LightGBM": lgb.LGBMClassifier(
-            n_estimators=200,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_samples=10,
-            random_state=42,
-            verbose=-1,
-        ),
-        "CatBoost": CatBoostClassifier(
-            iterations=200,
-            depth=3,
-            learning_rate=0.05,
-            min_data_in_leaf=10,
-            random_seed=42,
-            verbose=0,
-        ),
-    }
-
-
-def evaluate_feature_set(
-    features: list[str],
-    label: str,
-    path: str = "Datasets/train_dataset.csv",
-) -> pd.DataFrame:
-    X, y, df = load_data(path, features)
-
-    if y.nunique() < 2:
-        raise ValueError(f"Target has less than 2 classes for feature set: {label}")
-
-    min_class_count = y.value_counts().min()
-    n_splits = min(5, int(min_class_count))
-
-    if n_splits < 2:
-        raise ValueError(f"Not enough samples per class for CV in feature set: {label}")
-
+    y_bins = pd.qcut(y, q=5, labels=False, duplicates="drop")
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    models = make_models()
-    f1_weighted = make_scorer(f1_score, average="weighted")
 
-    print(f"\n{'='*60}")
-    print(f"Feature set: {label}  |  n={len(df)}  |  features={len(features)}")
-    print(f"Target alpha_intensity distribution:")
-    print(df[TARGET].astype(int).value_counts().sort_index().to_string())
-    print(f"Encoded target distribution:")
-    print(y.value_counts().sort_index().to_string())
-    print(f"CV splits: {n_splits}")
-    print(f"{'='*60}")
+    print("Fold stability check (target distribution per fold):")
+    for fold, (_, test_idx) in enumerate(cv.split(X, y_bins), 1):
+        fold_y = y.iloc[test_idx]
+        print(f"  Fold {fold} | n={len(fold_y)} | mean={fold_y.mean():.4f} | std={fold_y.std():.4f}")
 
-    results = []
 
-    for name, model in models.items():
-        n_jobs = -1 if name not in ("CatBoost", "GradientBoosting") else 1
+def optimize_hyperparams(
+        df: pd.DataFrame,
+        n_trials: int = 50,
+        n_splits: int = 5,
+) -> dict:
+    """
+    Input: DataFrame with market features and real_alpha, number of Optuna trials, CV folds
+    Output: best hyperparameter dict found by Optuna
+    """
+    X = df[MARKET_FEATURES]
+    y = df[TARGET]
+    y_bins = pd.qcut(y, q=5, labels=False, duplicates="drop")
 
-        acc_scores = cross_val_score(
-            model, X, y,
-            cv=cv,
-            scoring="accuracy",
-            n_jobs=n_jobs,
-            error_score="raise",
+    def objective(trial):
+        params = {
+            "iterations": trial.suggest_int("iterations", 100, 800),
+            "depth": trial.suggest_int("depth", 2, 6),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 10.0),
+        }
+
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        scores = []
+
+        for train_idx, test_idx in cv.split(X, y_bins):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_train, y_train, test_size=0.15, random_state=42
+            )
+
+            model = CatBoostRegressor(
+                **params,
+                loss_function="RMSE",
+                early_stopping_rounds=50,
+                random_seed=42,
+                verbose=0,
+            )
+            model.fit(X_tr, y_tr, eval_set=(X_val, y_val), use_best_model=True)
+            pred = model.predict(X_test)
+            scores.append(mean_squared_error(y_test, pred) ** 0.5)
+
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=n_trials)
+
+    print(f"\nOptuna best RMSE: {study.best_value:.4f}")
+    print(f"Best params: {study.best_params}")
+
+    return study.best_params
+
+
+def add_alpha_hat_oof(
+        path: str = INPUT_PATH,
+        output_path: str = OUTPUT_PATH,
+        n_splits: int = 5,
+        n_repeats: int = 10,
+        best_params: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Input: train_dataset.csv path, output path, number of CV folds
+    Output: DataFrame with out-of-fold alpha_hat column saved to csv
+    """
+    df = load_market_dataset(path)
+
+    X = df[MARKET_FEATURES]
+    y = df[TARGET]
+    y_bins = pd.qcut(y, q=5, labels=False, duplicates="drop")
+
+    params = best_params or {}
+    cv = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=42)
+
+    alpha_hat_accum = np.zeros(len(df))
+    counts = np.zeros(len(df))
+
+    for fold, (train_idx, test_idx) in enumerate(cv.split(X, y_bins), 1):
+        model = build_market_model(**{k: params[k] for k in params if k in build_market_model.__code__.co_varnames})
+
+        X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+        X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
+
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train, test_size=0.15, random_state=fold
         )
 
-        f1_scores = cross_val_score(
-            model, X, y,
-            cv=cv,
-            scoring=f1_weighted,
-            n_jobs=n_jobs,
-            error_score="raise",
-        )
+        model.fit(X_tr, y_tr, eval_set=(X_val, y_val), use_best_model=True)
+        pred = model.predict(X_test)
 
-        results.append({
-            "feature_set": label,
-            "model": name,
-            "ACC_mean": round(acc_scores.mean(), 4),
-            "ACC_std": round(acc_scores.std(), 4),
-            "F1_mean": round(f1_scores.mean(), 4),
-            "F1_std": round(f1_scores.std(), 4),
-        })
+        alpha_hat_accum[test_idx] += pred
+        counts[test_idx] += 1
 
-        print(f"{name:20s}  ACC={acc_scores.mean():.4f} ± {acc_scores.std():.4f}  "
-              f"F1={f1_scores.mean():.4f} ± {f1_scores.std():.4f}")
+        rmse = mean_squared_error(y_test, pred) ** 0.5
+        print(f"Fold {fold:>3}: RMSE={rmse:.4f} | best_iter={model.best_iteration_}")
 
-    results_df = pd.DataFrame(results).sort_values("ACC_mean", ascending=False)
-    best_name = results_df.iloc[0]["model"]
+    df["alpha_hat"] = alpha_hat_accum / np.maximum(counts, 1)
 
-    print(f"\nЛучшая модель по accuracy: {best_name}")
+    rmse_total = mean_squared_error(df[TARGET], df["alpha_hat"]) ** 0.5
+    spearman = spearmanr(df["alpha_hat"], df[TARGET])
+    kendall = kendalltau(df["alpha_hat"], df[TARGET])
 
-    best_model = models[best_name]
-    best_model.fit(X, y)
+    print("\nOOF result:")
+    print(f"RMSE:     {rmse_total:.4f}")
+    print(f"Spearman: {spearman.statistic:.4f}, p={spearman.pvalue:.4f}")
+    print(f"Kendall:  {kendall.statistic:.4f}, p={kendall.pvalue:.4f}")
 
-    if hasattr(best_model, "feature_importances_"):
-        importances = best_model.feature_importances_
-    elif hasattr(best_model, "named_steps"):
-        m = best_model.named_steps["model"]
-        importances = np.abs(m.coef_).mean(axis=0) if hasattr(m, "coef_") else None
-    else:
-        importances = None
+    df.to_csv(output_path, index=False)
+    print(f"\nSaved to: {output_path}")
 
-    if importances is not None:
-        print(f"Feature importance ({best_name}):")
-        for feat, imp in sorted(
-            zip(features, importances), key=lambda x: x[1], reverse=True
-        ):
-            print(f"  {feat:30s}  {imp:.4f}")
+    return df
 
-    return results_df
+#Plots
 
+def plot_error_minimization(
+        path: str = INPUT_PATH,
+        test_size: float = 0.2,
+        max_iterations: int = 800,
+        best_params: dict | None = None,
+) -> None:
+    """
+    Input: train_dataset.csv path, validation size, max CatBoost iterations
+    Output: plot of train and validation RMSE by iteration
+    """
+    df = load_market_dataset(path)
 
-def compare_feature_sets(path: str = "Datasets/train_dataset.csv") -> pd.DataFrame:
-    sets = [
-        (FEATURES_DCF, "DCF only"),
-        (FEATURES_MARKET, "Market only"),
-        (FEATURES_FULL, "Full"),
-    ]
+    X = df[MARKET_FEATURES]
+    y = df[TARGET]
 
-    all_results = []
-    for features, label in sets:
-        res = evaluate_feature_set(features, label, path=path)
-        all_results.append(res)
-
-    combined = pd.concat(all_results, ignore_index=True)
-
-    print(f"\n{'='*60}")
-    print("Сводная таблица лучших моделей по каждому набору фичей:")
-    print(f"{'='*60}")
-
-    summary = (
-        combined.sort_values("ACC_mean", ascending=False)
-        .groupby("feature_set", sort=False)
-        .first()
-        .reset_index()
-        [["feature_set", "model", "ACC_mean", "ACC_std", "F1_mean", "F1_std"]]
+    X_train, X_valid, y_train, y_valid = train_test_split(
+        X, y,
+        test_size=test_size,
+        random_state=42,
+        shuffle=True,
     )
 
-    print(summary.to_string(index=False))
+    params = best_params or {}
+    model = CatBoostRegressor(
+        iterations=max_iterations,
+        depth=params.get("depth", 3),
+        learning_rate=params.get("learning_rate", 0.05),
+        l2_leaf_reg=params.get("l2_leaf_reg", 3.0),
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        early_stopping_rounds=50,
+        random_seed=42,
+        verbose=0,
+    )
 
-    return combined
+    model.fit(
+        X_train, y_train,
+        eval_set=(X_valid, y_valid),
+        use_best_model=False,
+    )
+
+    evals = model.get_evals_result()
+    train_rmse = evals["learn"]["RMSE"]
+    valid_rmse = evals["validation"]["RMSE"]
+
+    best_iter = int(np.argmin(valid_rmse))
+    best_rmse = float(valid_rmse[best_iter])
+
+    print(f"Best iteration: {best_iter + 1}")
+    print(f"Best validation RMSE: {best_rmse:.4f}")
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(train_rmse, label="train RMSE")
+    plt.plot(valid_rmse, label="validation RMSE")
+    plt.axvline(best_iter, linestyle="--", label=f"best iter = {best_iter + 1}")
+    plt.xlabel("Iteration")
+    plt.ylabel("RMSE")
+    plt.title("CatBoost error minimization")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def plot_alpha_hat_dependency(df: pd.DataFrame) -> None:
+    """
+    Input: DataFrame with real_alpha and alpha_hat
+    Output: scatter plot and conditional probability plot
+    """
+    data = df.dropna(subset=["alpha_hat", TARGET]).copy()
+
+    plt.figure(figsize=(6, 4))
+    plt.scatter(data["alpha_hat"], data[TARGET], alpha=0.3)
+    plt.xlabel("alpha_hat")
+    plt.ylabel("real_alpha")
+    plt.title("alpha_hat vs real_alpha")
+    plt.grid(True)
+    plt.show()
+
+    data["alpha_hat_bin"] = pd.qcut(data["alpha_hat"], 10, duplicates="drop")
+    prob = data.groupby("alpha_hat_bin", observed=True)[TARGET].apply(lambda x: (x > 0).mean())
+
+    print("\nP(alpha > 0 | alpha_hat):")
+    print(prob)
+
+    plt.figure(figsize=(8, 4))
+    prob.plot(kind="bar")
+    plt.ylabel("P(alpha > 0)")
+    plt.title("P(alpha > 0 | alpha_hat)")
+    plt.grid(True)
+    plt.show()
+
+#Final model (for production)
+
+def train_final_model(df: pd.DataFrame, best_params: dict | None = None) -> CatBoostRegressor:
+    """
+    Input: DataFrame with market features and real_alpha
+    Output: trained CatBoost model on full dataset
+    """
+    X = df[MARKET_FEATURES]
+    y = df[TARGET]
+
+    params = best_params or {}
+    model = build_market_model(**{k: params[k] for k in params if k in build_market_model.__code__.co_varnames})
+    model.fit(X, y)
+
+    return model
+
+
+def save_model(model: CatBoostRegressor, path: str = "Models/market_model.cbm") -> None:
+    """
+    Input: trained CatBoost model, file path
+    Output: saved model to disk
+    """
+    model.save_model(path)
+    print(f"Model saved to: {path}")
+
+
+def load_model(path: str = "Models/market_model.cbm") -> CatBoostRegressor:
+    """
+    Input: path to saved model
+    Output: loaded CatBoost model
+    """
+    model = CatBoostRegressor()
+    model.load_model(path)
+    return model
+
+#Notes
+
+'''
+To evaluate the predictive capacity of market information, we trained a regression model using only
+aggregated market features (volatility, momentum, beta, and related statistics) to estimate realized
+alpha. The results show that while the model cannot precisely predict alpha in magnitude (high RMSE),
+it captures a statistically significant monotonic relationship with the true outcomes (positive Spearman
+and Kendall correlations). This indicates that market data primarily encodes regime-level information, rather
+than idiosyncratic mispricing.
+In parallel, the DCF-derived signal (implied upside) demonstrates only weak direct correlation with realized
+alpha and exhibits unstable conditional behavior when used in isolation. However, importantly, it remains
+largely uncorrelated with the market-based prediction (alpha_hat), suggesting that it carries orthogonal information.
+This orthogonality implies that DCF is not redundant with market features, but rather represents an independent
+dimension of the valuation signal.
+As a result, the project does not treat DCF as a direct predictor within the ML model. Instead, it is incorporated
+at a later stage via a copula-based framework, where both market-driven expectations and fundamental signals are
+combined to estimate the conditional distribution of alpha.
+'''
 
 
 if __name__ == "__main__":
-    compare_feature_sets()
+    try:
+        import os
+        os.remove("Datasets/train_dataset_full.csv")
+        os.remove("Models/market_model.cbm")
+    except FileNotFoundError:
+        pass
+
+    df = load_market_dataset()
+
+    check_fold_stability(df)
+
+    best_params = optimize_hyperparams(df, n_trials=50)
+
+    df = add_alpha_hat_oof(best_params=best_params)
+
+    # train final model and save
+    final_model = train_final_model(df, best_params=best_params)
+    save_model(final_model)
+
+    plot_alpha_hat_dependency(df) #Just some visualization for better project presentation
+    plot_error_minimization(best_params=best_params) #Found the extreme value of error coefficient -> min

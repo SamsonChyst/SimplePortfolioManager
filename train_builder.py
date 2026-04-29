@@ -1,50 +1,43 @@
-import os
 import json
 from pathlib import Path
 import pandas as pd
 from dataset_processor import has_fundamentals, time_slicing
-from valuation_marker import target_row, label_maker, get_market_3y_return, RATE_THRESHOLD
+from valuation_marker import target_row, get_market_3y_return
 
 
 #Notes
 '''
-Dataset Construction Methodology - High-Rate Regime Study
+Dataset Construction Methodology - Base Alpha Dataset
 
-This dataset targets the high-rate market regime defined by US 10-Year Treasury Bond
-rate >= 3.0% (RATE_THRESHOLD). The structural motivation is an empirically observed
-break in Kendall's tau between DCF-implied upside and one-year realized excess return
-(real_alpha = stock return - S&P 500 return):
-  * Low-rate regime  (T_Bond < 3.0%):  tau = 0.057  - DCF signal negligible
-  * High-rate regime (T_Bond >= 3.0%): tau = 0.172  - DCF signal meaningful
+This module builds the base ticker-year dataset used before the machine learning and copula stages.
+Each observation represents one ticker at one valuation year and contains three groups of information:
 
-The high-rate regime corresponds to years where elevated discount rates caused the market
-to re-anchor valuations to fundamentals, restoring the predictive content of DCF analysis.
-In the 2014-2025 window this applies to 2022, 2023, 2024, 2025.
+  1. Realized outcome:
+     real_alpha = one-year stock return minus one-year S&P 500 return.
 
-JSON files (target_{year}.json) are built for all years 2014-2025 and all regimes -
-this allows comparative analysis between regimes. The final ML dataset (train_dataset.csv)
-is filtered to high-rate observations only (t_bond_rate >= 3.0%).
+  2. Fundamental valuation signal:
+     implied_upside is produced by the DCF valuation module and is kept as an independent
+     fundamental signal. It is not transformed into old copula-based labels at this stage.
 
-The Clayton copula used for soft label generation (P(alpha > 0), E(alpha)) is fitted
-exclusively on high-rate observations with one-year alpha horizon.
+  3. Market regime features:
+     aggregated market-based variables are computed from the one-year market window prior
+     to the valuation year using filing-date-aware time slicing.
 
-Alpha intensity scale (one-year real_alpha vs S&P 500):
-  -2  strong negative:  alpha < -0.60   (below 25th percentile of high-rate distribution)
-  -1  weak negative:    -0.60 <= alpha < 0
-  +1  weak positive:    0 < alpha <= 0.30
-  +2  strong positive:  alpha > 0.30    (above ~67th percentile of high-rate distribution)
+The dataset is restricted to the high-rate regime defined by:
+  T_Bond_Rate >= RATE_THRESHOLD
 
-Final feature set per ticker-year observation:
-  Valuation:  implied_upside, p_alpha_gt_0, e_alpha
-  Macro:      t_bond_rate
-  Risk:       beta_ewm_median, volatility_21d_mean, volatility_21d_max
-  Volume:     log_volume_mean
-  Regime:     market_deviation_mean, market_deviation_std,
-              market_momentum_mean, market_momentum_std, market_3y_return
-  Label:      real_alpha, alpha_intensity
+This restriction is based on the empirical observation that the DCF signal has stronger
+relationship with realized alpha during high-rate periods. However, this module does not
+fit a copula and does not create probability labels. Its purpose is only to construct the
+clean base dataset used later by:
+
+  - market-only ML model: market features -> alpha_hat
+  - vine copula model: real_alpha, alpha_hat, implied_upside, t_bond_rate
 '''
 
 #cfg
+RATE_THRESHOLD = 0.030 #Threshold of T-Bonds to stratificate market regimes
+
 TICKERS_DIR = Path("Datasets/tickers")
 TRAIN_DIR   = Path("Datasets/train")
 OUTPUT_PATH = Path("Datasets/train_dataset.csv")
@@ -78,7 +71,8 @@ def ticker_is_valid(ticker: str) -> bool:
 def list_tickers() -> list[str]:
     return [
         t for t in os.listdir(TICKERS_DIR)
-        if ticker_is_valid(t)]
+        if ticker_is_valid(t)
+    ]
 
 
 def row_is_valid(row: pd.Series) -> bool:
@@ -105,27 +99,6 @@ def get_t_bond_rate(year: int) -> float | None:
     if pd.isna(val):
         return None
     return float(val)
-
-
-def alpha_to_intensity(alpha: float) -> int:
-    """
-    Input: real_alpha (one-year excess return vs S&P 500)
-    Output: ordinal intensity label
-      -2: strong negative (alpha < -0.60)
-      -1: weak negative   (-0.60 <= alpha < 0)
-      +1: weak positive   (0 < alpha <= 0.30)
-      +2: strong positive (alpha > 0.30)
-    Thresholds derived from high-rate regime distribution:
-      -0.60 ~ 25th percentile, +0.30 ~ 67th percentile
-    """
-    if alpha < -0.60:
-        return -2
-    elif alpha < 0.0:
-        return -1
-    elif alpha <= 0.30:
-        return 1
-    else:
-        return 2
 
 
 def aggregate_market_features(df: pd.DataFrame) -> dict:
@@ -168,7 +141,7 @@ def build_row(
 ) -> pd.Series | None:
     """
     Input: ticker and one target json payload
-    Output: single-row pd.Series with all features and labels, or None if invalid
+    Output: single-row pd.Series with valuation signal, market features, and real_alpha
     """
     valuation_year = target.get("valuation_year")
     implied_upside = target.get("implied_upside")
@@ -178,14 +151,6 @@ def build_row(
     if any(v is None for v in [valuation_year, implied_upside, t_bond_rate, real_alpha]):
         return None
     if float(t_bond_rate) < RATE_THRESHOLD:
-        return None
-
-    try:
-        labels = label_maker(float(implied_upside))
-    except Exception:
-        return None
-
-    if labels is None or labels.empty:
         return None
 
     try:
@@ -201,14 +166,11 @@ def build_row(
         return None
 
     row = {
-        "ticker":          ticker,
-        "valuation_year":  int(valuation_year),
-        "implied_upside":  float(implied_upside),
-        "t_bond_rate":     float(t_bond_rate),
-        "p_alpha_gt_0":    float(labels["P(alpha > 0)"]),
-        "e_alpha":         float(labels["E(alpha)"]),
-        "real_alpha":      float(real_alpha),
-        "alpha_intensity": int(alpha_to_intensity(float(real_alpha))),
+        "ticker":         ticker,
+        "valuation_year": int(valuation_year),
+        "implied_upside": float(implied_upside),
+        "t_bond_rate":    float(t_bond_rate),
+        "real_alpha":     float(real_alpha),
     }
     row.update(market_features)
 
@@ -341,20 +303,22 @@ def build_dataset() -> None:
     col_order = [
         "ticker", "valuation_year",
         "implied_upside", "t_bond_rate",
-        "p_alpha_gt_0", "e_alpha",
         "beta_ewm_median",
         "volatility_21d_mean", "volatility_21d_max",
         "log_volume_mean",
         "market_deviation_mean", "market_deviation_std",
         "market_momentum_mean", "market_momentum_std",
         "market_3y_return",
-        "real_alpha", "alpha_intensity",
+        "real_alpha",
     ]
     col_order = [c for c in col_order if c in df.columns]
     df = df[col_order]
 
-    print(f"\nalpha_intensity distribution:")
-    print(df["alpha_intensity"].value_counts().sort_index())
+    print(f"\nreal_alpha distribution:")
+    print(df["real_alpha"].describe().round(4))
+
+    print(f"\nimplied_upside distribution:")
+    print(df["implied_upside"].describe().round(4))
 
     df.to_csv(OUTPUT_PATH, index=False)
     print(f"\n[build_dataset] done - {len(df)} rows saved to {OUTPUT_PATH}")
@@ -363,9 +327,11 @@ def build_dataset() -> None:
 
 if __name__ == "__main__":
     try:
-        import shutil
+        import shutil, os
         shutil.rmtree("Datasets/train/")
+        os.remove("Datasets/train_dataset.csv")
     except FileNotFoundError:
         pass
+
     build_json()
     build_dataset()
