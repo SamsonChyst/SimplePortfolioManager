@@ -158,6 +158,20 @@ def load_copula_config(path: Path = COPULA_CFG_PATH) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def prepare_copula_runtime(
+        train_path: str = "Datasets/train_dataset_full.csv"
+) -> None:
+    """
+    Input: path to train dataset
+    Output: loads empirical marginals for live prediction
+    """
+    global _alpha_sorted, _ah_values, _iu_values
+
+    if _alpha_sorted is not None and _ah_values is not None and _iu_values is not None:
+        return
+
+    df = pd.read_csv(train_path)
+    fit_marginals(df)
 
 #Saving
 
@@ -255,6 +269,13 @@ def copula_predict(
     prob_positive = float(np.trapezoid(density * (alpha_vals > 0).astype(float), w))
     prob_negative = float(np.trapezoid(density * (alpha_vals < 0).astype(float), w))
 
+    prob_alpha_lt_minus_10 = float(
+        np.trapezoid(density * (alpha_vals < -0.10).astype(float), w)
+    )
+    prob_alpha_lt_minus_20 = float(
+        np.trapezoid(density * (alpha_vals < -0.20).astype(float), w)
+    )
+
     positive_mask = alpha_vals > 0
     negative_mask = alpha_vals < 0
 
@@ -271,11 +292,13 @@ def copula_predict(
         if negative_area > 0 else np.nan
     )
 
-    alpha_sharpe_like = expected_alpha / alpha_std if alpha_std > 0 else np.nan
+    alpha_efficiency = expected_alpha / alpha_std if alpha_std > 0 else np.nan
 
     result = {
         "prob_positive": prob_positive,
         "prob_negative": prob_negative,
+        "prob_alpha_lt_minus_10": prob_alpha_lt_minus_10,
+        "prob_alpha_lt_minus_20": prob_alpha_lt_minus_20,
         "expected_alpha": expected_alpha,
         "median_alpha": float(q50),
         "alpha_std": alpha_std,
@@ -286,16 +309,19 @@ def copula_predict(
         "alpha_q95": float(q95),
         "expected_upside": expected_upside,
         "expected_downside": expected_downside,
-        "alpha_sharpe_like": float(alpha_sharpe_like),
+        "alpha_efficiency": float(alpha_efficiency),
+        "alpha_sharpe_like": float(alpha_efficiency),
         "implied_upside_percentile": u_iu_obs,
         "alpha_hat_percentile": u_ah_obs,
     }
 
     for threshold in thresholds:
         key = str(threshold).replace("-", "minus_").replace(".", "_")
+
         result[f"prob_alpha_gt_{key}"] = float(
             np.trapezoid(density * (alpha_vals > threshold).astype(float), w)
         )
+
         result[f"prob_alpha_lt_{key}"] = float(
             np.trapezoid(density * (alpha_vals < threshold).astype(float), w)
         )

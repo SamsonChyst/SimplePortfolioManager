@@ -220,6 +220,7 @@ def load_train_jsons(train_dir: str = "Datasets/train/") -> pd.DataFrame:
     df = pd.DataFrame(rows)
     return df
 
+
 #main
 
 def live_market_features(
@@ -291,3 +292,45 @@ def live_market_features(
         "market_momentum_std": float(market_momentum.std()),
         "market_3y_return": get_market_3y_return_from_df(df),
     })
+
+
+def get_copula_data(
+        ticker: str,
+        implied_upside: float,
+        t_bond_rate: float
+) -> pd.Series:
+    """
+    Input: ticker, implied upside and 10Y US T-Bills yield
+    Output: result of copula predict
+    """
+    from copula_logic import copula_predict, prepare_copula_runtime
+    from ml import load_model, MARKET_FEATURES
+
+    row = live_market_features(ticker, t_bond_rate)
+
+    if row.empty:
+        return pd.Series(dtype="float64")
+
+    x = pd.DataFrame([row])[MARKET_FEATURES]
+    x = x.apply(pd.to_numeric, errors="coerce")
+
+    if x.isna().any().any():
+        bad_cols = x.columns[x.isna().any()].tolist()
+        raise ValueError(f"Missing or non-numeric ML features: {bad_cols}")
+
+    model = load_model()
+    alpha_hat = float(model.predict(x)[0])
+
+    prepare_copula_runtime()
+
+    result = copula_predict(
+        alpha_hat=alpha_hat,
+        implied_upside=implied_upside
+    )
+
+    result["ticker"] = ticker.upper().strip()
+    result["implied_upside"] = implied_upside
+    result["t_bond_rate"] = t_bond_rate
+    result["alpha_hat"] = alpha_hat
+
+    return result
