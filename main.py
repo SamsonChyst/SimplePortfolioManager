@@ -1,8 +1,25 @@
+from pathlib import Path
+from main_helper import *
+from report_export import create_report
+
+
 if __name__ == "__main__":
-    from report_export import create_report
+    try:
+        check_runtime_files()
 
-    Ticker: str = input("Enter a ticker of a US company (e.g NVDA)")
-    ImpliedUpside: float = input("Enter your DCF-based implied upside (e.g 0.3 for 30%)")
-    TBondRate: float = input("Enter current 10Y US T-Bond Yield Rate (e.g 0.042 for 2026)")
+        ticker, implied_upside, t_bond_rate = gui_inputs()
 
-    create_report(Ticker, ImpliedUpside, TBondRate)
+        pdf_path = create_report(
+            ticker=ticker,
+            implied_upside=implied_upside,
+            t_bond_rate=t_bond_rate,
+        )
+
+        show_success(Path(pdf_path))
+
+    except InputCancelled:
+        pass
+
+    except Exception as e:
+        log_path = save_error_log(e)
+        show_error(RuntimeError(f"{e}\n\nDetails were saved to: {log_path}"))

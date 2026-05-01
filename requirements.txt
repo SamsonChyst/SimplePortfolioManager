@@ -1,0 +1,11 @@
+numpy==2.4.3
+pandas==3.0.1
+scipy==1.17.1
+matplotlib==3.10.8
+requests==2.32.5
+yfinance==1.2.0
+python-dotenv==1.2.2
+catboost==1.2.10
+scikit-learn==1.8.0
+optuna==4.8.0
+fastparquet==2026.3.0

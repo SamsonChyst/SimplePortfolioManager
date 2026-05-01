@@ -3,6 +3,7 @@ from pathlib import Path
 import pandas as pd
 from modules_processor import has_fundamentals, time_slicing, get_market_3y_return
 from valuation_dcf import target_row
+import os
 
 #cfg
 RATE_THRESHOLD = 0.030 #Threshold of T-Bonds to stratificate market regimes
